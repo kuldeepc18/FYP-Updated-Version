@@ -15,6 +15,7 @@ const path    = require('path');
 const crypto  = require('crypto');
 
 const QUESTDB_URL    = 'http://127.0.0.1:9000/exec';
+const QUESTDB_ILP    = 'http://127.0.0.1:9000/write'; // ILP HTTP ingestion endpoint
 const JWT_SECRET     = 'ktrade_admin_jwt_secret_2026';
 const USER_JWT_SECRET = 'ktrade_user_jwt_secret_2026';
 const PORT           = 3000;
@@ -112,6 +113,47 @@ const INSTRUMENTS = {
   14: { id: '14', name: 'Sensex',                     symbol: 'SENSEX',            basePrice: 84961.14  },
   15: { id: '15', name: 'Nifty Next 50 Index',        symbol: 'NIFTY NEXT 50',     basePrice: 70413.4   },
 };
+
+// ─── QuestDB ILP writer — persists a single user order event ────────────────
+// Uses QuestDB's InfluxDB Line Protocol HTTP endpoint (port 9000 /write).
+// Tag columns (SYMBOL): order_id, instrument_id, order_type, side, status, user_id
+// Field columns       : price (DOUBLE), quantity (LONG), filled_quantity (LONG)
+// order_id format mirrors the C++ engine: {instrument_id}-{timestamp_ms}-{userId}
+async function writeUserTradeToQuestDB(order, fillPrice, filledQty, status) {
+  try {
+    const instEntry    = Object.values(INSTRUMENTS).find(i => i.symbol === order.symbol);
+    const instrumentId = instEntry ? instEntry.id : '0';
+    const nowMs        = Date.now();
+    // Unique order_id: instrument_id-timestamp_ms-userId  (no hyphens inside any part)
+    const questOrderId = `${instrumentId}-${nowMs}-${order.userId}`;
+    const tsNs         = BigInt(nowMs) * 1_000_000n; // ms → ns for ILP timestamp
+
+    // ILP tag values must escape spaces (→ '\ '), commas (→ '\,'), '=' (→ '\=')
+    const esc = s => String(s).replace(/,/g, '\\,').replace(/=/g, '\\=').replace(/ /g, '\\ ');
+
+    // Build line: <table>,<tags> <fields> <timestamp_ns>
+    const line =
+      `trade_logs` +
+      `,order_id=${esc(questOrderId)}` +
+      `,instrument_id=${esc(instrumentId)}` +
+      `,order_type=${esc(order.orderType || 'MARKET')}` +
+      `,side=${esc(order.side)}` +
+      `,status=${esc(status)}` +
+      `,user_id=${esc(order.userId)}` +
+      ` price=${Number(fillPrice)}` +
+      `,quantity=${order.quantity}i` +
+      `,filled_quantity=${filledQty}i` +
+      ` ${tsNs}\n`;
+
+    await axios.post(QUESTDB_ILP, line, {
+      headers : { 'Content-Type': 'text/plain' },
+      timeout : 5000,
+    });
+    console.log(`[QuestDB ILP] user_id=${order.userId} ${order.side} ${order.quantity}x${order.symbol} @ ${fillPrice} → ${status}`);
+  } catch (err) {
+    console.error('[QuestDB ILP] write failed:', err.response?.data || err.message);
+  }
+}
 
 // ─── QuestDB helper ───────────────────────────────────────────────────────────
 async function questdb(sql) {
@@ -1142,6 +1184,9 @@ app.get('/api/admin/health', (_req, res) => res.json({ status: 'ok', ts: new Dat
 // ─── Background Paper-Trading Matching Loop ──────────────────────────────────
 // Runs every 1 second. Fills PENDING user orders against live QuestDB prices,
 // triggers target/SL auto square-offs, and expires INTRADAY orders at 3:30 PM IST.
+// Every state transition (FILLED / CANCELLED / EXPIRED) is written to QuestDB
+// trade_logs via ILP so that  SELECT * FROM trade_logs WHERE user_id = '10001'
+// returns real user trades alongside mock-trader trades.
 async function runMatchingLoop() {
   try {
     const orders = readUserOrders();
@@ -1157,6 +1202,8 @@ async function runMatchingLoop() {
 
     let changed        = false;
     const newAutoOrders = [];
+    // Collect events that must be written to QuestDB after file is saved
+    const questdbWrites = []; // { order, fillPrice, filledQty, status }
 
     orders.forEach(order => {
       if (order.status !== 'PENDING' && order.status !== 'PARTIAL') return;
@@ -1173,6 +1220,7 @@ async function runMatchingLoop() {
           const idx   = users.findIndex(u => u.id === order.userId);
           if (idx !== -1) { users[idx].balance = (users[idx].balance || 0) + order.quantity * (order.price || currentPrice) * 1.002; writeUsers(users); }
         }
+        questdbWrites.push({ order: { ...order }, fillPrice: order.price || currentPrice, filledQty: 0, status: 'EXPIRED' });
         changed = true;
         return;
       }
@@ -1214,6 +1262,8 @@ async function runMatchingLoop() {
             writeUsers(users);
           }
         }
+        // Queue write to QuestDB trade_logs so the trade is visible per user_id
+        questdbWrites.push({ order: { ...order }, fillPrice, filledQty: order.quantity, status: 'FILLED' });
         changed = true;
       }
     });
@@ -1274,6 +1324,13 @@ async function runMatchingLoop() {
       writeUserOrders([...newAutoOrders, ...orders]);
     } else if (changed) {
       writeUserOrders(orders);
+    }
+
+    // Write all new events to QuestDB trade_logs (non-blocking — fire-and-forget)
+    if (questdbWrites.length) {
+      questdbWrites.forEach(({ order, fillPrice, filledQty, status }) => {
+        writeUserTradeToQuestDB(order, fillPrice, filledQty, status).catch(() => {});
+      });
     }
   } catch (err) {
     console.error('[MatchingLoop]', err.message);
