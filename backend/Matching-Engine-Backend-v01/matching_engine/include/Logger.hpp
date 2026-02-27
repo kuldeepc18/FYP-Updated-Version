@@ -39,6 +39,7 @@
  * Table: trade_logs
  *   timestamp       TIMESTAMP  (designated, partition key)
  *   order_id        SYMBOL
+ *   instrument_id   SYMBOL     numeric instrument ID (1–15), extracted from order_id
  *   order_type      SYMBOL     LIMIT | MARKET
  *   side            SYMBOL     BUY | SELL
  *   price           DOUBLE
@@ -106,17 +107,20 @@ public:
         const long long   ts        = toNanos(order.getTimestamp());
         const std::string orderId   = sanitizeTag(order.getOrderId());
         const std::string userId    = sanitizeTag(order.getTraderId());
+        // Extract instrument_id directly from the order (avoids string-splitting)
+        const std::string instrId   = std::to_string(order.getInstrumentId());
 
         // ── Build QuestDB ILP line ────────────────────────────────────────────
-        // Tags (SYMBOL columns): order_id, order_type, side, status, user_id
+        // Tags (SYMBOL columns): order_id, instrument_id, order_type, side, status, user_id
         // Fields (numeric): price, quantity, filled_quantity
         std::ostringstream ilp;
         ilp << "trade_logs"
-            << ",order_id="   << orderId
-            << ",order_type=" << ordType
-            << ",side="       << side
-            << ",status="     << status
-            << ",user_id="    << userId
+            << ",order_id="      << orderId
+            << ",instrument_id=" << instrId
+            << ",order_type="    << ordType
+            << ",side="          << side
+            << ",status="        << status
+            << ",user_id="       << userId
             << " "
             << "price="            << std::fixed << order.getPrice()
             << ",quantity="        << qty       << "i"

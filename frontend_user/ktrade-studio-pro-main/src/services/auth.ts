@@ -1,7 +1,8 @@
 import { apiClient, API_ENDPOINTS } from '@/config/api';
 
-interface User {
+export interface User {
   id: string;
+  numericId?: number | null;
   email: string;
   name: string;
   balance: number;
@@ -77,6 +78,51 @@ class AuthService {
     }
   }
 
+  async addBalance(amount: number): Promise<{ balance: number; added: number }> {
+    try {
+      const response = await apiClient.post(API_ENDPOINTS.USER.BALANCE_ADD, { amount });
+      // Persist updated balance in localStorage
+      const stored = this.getAuthState();
+      if (stored?.user) {
+        const updated = { ...stored, user: { ...stored.user, balance: response.data.balance } };
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(updated));
+      }
+      return response.data;
+    } catch (error: any) {
+      throw new Error(error.response?.data?.message || 'Failed to add balance');
+    }
+  }
+
+  async withdrawBalance(amount: number): Promise<{ balance: number; withdrawn: number }> {
+    try {
+      const response = await apiClient.post(API_ENDPOINTS.USER.BALANCE_WITHDRAW, { amount });
+      // Persist updated balance in localStorage
+      const stored = this.getAuthState();
+      if (stored?.user) {
+        const updated = { ...stored, user: { ...stored.user, balance: response.data.balance } };
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(updated));
+      }
+      return response.data;
+    } catch (error: any) {
+      throw new Error(error.response?.data?.message || 'Failed to withdraw balance');
+    }
+  }
+
+  async getMe(): Promise<User | null> {
+    try {
+      const response = await apiClient.get(API_ENDPOINTS.AUTH.ME);
+      const user = response.data as User;
+      // Update localStorage with fresh balance
+      const stored = this.getAuthState();
+      if (stored) {
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify({ ...stored, user }));
+      }
+      return user;
+    } catch {
+      return null;
+    }
+  }
+
   getAuthState(): AuthState | null {
     const stored = localStorage.getItem(this.STORAGE_KEY);
     if (!stored) return null;
@@ -104,3 +150,4 @@ class AuthService {
 }
 
 export const authService = new AuthService();
+

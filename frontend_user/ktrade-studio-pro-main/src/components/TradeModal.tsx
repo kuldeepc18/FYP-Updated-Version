@@ -1,13 +1,12 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
 import { OrderType, OrderSide, OrderValidity } from '@/types/trading';
-import { orderService, marketDataService } from '@/services';
+import { orderServiceApi } from '@/services';
 import { useAppDispatch, useAppSelector } from '@/store/hooks';
 import { addOrder } from '@/store/tradingSlice';
 import { toast } from 'sonner';
@@ -21,101 +20,106 @@ interface TradeModalProps {
 }
 
 export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: TradeModalProps) => {
-  const dispatch = useAppDispatch();
-  const account = useAppSelector((state) => state.trading.account);
-  
-  const [side, setSide] = useState<OrderSide>(defaultSide);
-  const [orderType, setOrderType] = useState<OrderType>('MARKET');
-  const [validity, setValidity] = useState<OrderValidity>('INTRADAY');
-  const [quantity, setQuantity] = useState('1');
-  const [price, setPrice] = useState('');
-  const [stopPrice, setStopPrice] = useState('');
+  const dispatch   = useAppDispatch();
+  const symbols    = useAppSelector((s) => s.trading.symbols);
+  const account    = useAppSelector((s) => s.trading.account);
+  const authUser   = useAppSelector((s) => s.auth.user);
+
+  const [side, setSide]               = useState<OrderSide>(defaultSide);
+  const [orderType, setOrderType]     = useState<OrderType>('MARKET');
+  const [validity, setValidity]       = useState<OrderValidity>('INTRADAY');
+  const [quantity, setQuantity]       = useState('1');
+  const [price, setPrice]             = useState('');
+  const [stopPrice, setStopPrice]     = useState('');
   const [targetPrice, setTargetPrice] = useState('');
-  const [stopLoss, setStopLoss] = useState('');
-  const [autoQuantity, setAutoQuantity] = useState(false);
-  const [autoPercent, setAutoPercent] = useState('10');
+  const [stopLoss, setStopLoss]       = useState('');
+  const [loading, setLoading]         = useState(false);
 
-  const symbolData = marketDataService.getSymbol(symbol);
-  const currentPrice = symbolData?.price || 0;
+  // Reset side when defaultSide prop changes (e.g. buy vs sell button)
+  useEffect(() => { setSide(defaultSide); }, [defaultSide]);
 
-  const calculateQuantity = () => {
-    if (!autoQuantity || !autoPercent) return parseInt(quantity) || 0;
-    const percent = parseFloat(autoPercent) / 100;
-    const availableAmount = account.availableMargin * percent;
-    return Math.floor(availableAmount / currentPrice);
-  };
+  // Live price from SSE-driven redux symbols store
+  const symData     = symbols.find((s) => s.symbol === symbol);
+  const currentPrice = symData?.price || 0;
 
-  const effectiveQuantity = autoQuantity ? calculateQuantity() : parseInt(quantity) || 0;
-  const effectivePrice = orderType === 'MARKET' ? currentPrice : parseFloat(price) || currentPrice;
-  const totalValue = effectiveQuantity * effectivePrice;
-  const estimatedFees = totalValue * 0.001; // 0.1% simplified
-  const netAmount = totalValue + estimatedFees;
+  const qty          = Math.max(1, parseInt(quantity, 10) || 0);
+  const effPrice     = orderType === 'MARKET' ? currentPrice : (parseFloat(price) || currentPrice);
+  const orderValue   = qty * effPrice;
+  const fees         = orderValue * 0.001;
+  const netAmount    = side === 'BUY' ? orderValue + fees : orderValue - fees;
 
-  const handlePlaceOrder = () => {
-    if (effectiveQuantity <= 0) {
-      toast.error('Invalid quantity');
-      return;
-    }
+  const displayBalance = authUser?.balance ?? account.availableMargin;
 
-    if (orderType !== 'MARKET' && !price) {
-      toast.error('Price is required for limit orders');
-      return;
-    }
+  const handlePlaceOrder = async () => {
+    if (qty <= 0) { toast.error('Enter a valid quantity'); return; }
+    if (orderType !== 'MARKET' && !price) { toast.error('Price is required for limit orders'); return; }
+    if ((orderType === 'STOP' || orderType === 'STOP_LIMIT') && !stopPrice) { toast.error('Stop price is required'); return; }
 
+    setLoading(true);
     try {
-      const order = orderService.placeOrder({
+      const order = await orderServiceApi.placeOrder({
         symbol,
         side,
-        type: orderType,
-        quantity: effectiveQuantity,
-        price: orderType === 'MARKET' ? undefined : parseFloat(price),
-        stopPrice: stopPrice ? parseFloat(stopPrice) : undefined,
+        type       : orderType,
+        quantity   : qty,
+        price      : orderType !== 'MARKET' ? parseFloat(price) : undefined,
+        stopPrice  : stopPrice  ? parseFloat(stopPrice)  : undefined,
         targetPrice: targetPrice ? parseFloat(targetPrice) : undefined,
-        stopLoss: stopLoss ? parseFloat(stopLoss) : undefined,
+        stopLoss   : stopLoss   ? parseFloat(stopLoss)   : undefined,
         validity,
       });
-
       dispatch(addOrder(order));
-      toast.success(`Order placed: ${side} ${effectiveQuantity} ${symbol}`);
+      toast.success(`Order placed: ${side} ${qty} ${symbol} @ ${orderType === 'MARKET' ? 'Market' : `₹${price}`}`);
+      // Reset form
+      setQuantity('1');
+      setPrice('');
+      setStopPrice('');
+      setTargetPrice('');
+      setStopLoss('');
       onClose();
-    } catch (error) {
-      toast.error('Failed to place order');
+    } catch (err: any) {
+      const msg = err?.response?.data?.error || err?.message || 'Failed to place order';
+      toast.error(msg);
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
             <span>{symbol}</span>
-            <div className="flex items-center gap-4 text-sm">
-              <span className="text-muted-foreground">LTP:</span>
+            <div className="flex items-center gap-3 text-sm">
+              <span className="text-muted-foreground">LTP</span>
               <span className="font-bold text-lg">₹{currentPrice.toFixed(2)}</span>
+              {symData && (
+                <span className={symData.changePercent! >= 0 ? 'text-success text-sm' : 'text-destructive text-sm'}>
+                  {symData.changePercent! >= 0 ? '+' : ''}{symData.changePercent?.toFixed(2)}%
+                </span>
+              )}
             </div>
           </DialogTitle>
         </DialogHeader>
 
         <Tabs value={side} onValueChange={(v) => setSide(v as OrderSide)} className="w-full">
           <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="BUY" className="data-[state=active]:bg-success data-[state=active]:text-success-foreground">
-              <TrendingUp className="w-4 h-4 mr-2" />
-              BUY
+            <TabsTrigger value="BUY" className="data-[state=active]:bg-success data-[state=active]:text-white">
+              <TrendingUp className="w-4 h-4 mr-2" /> BUY
             </TabsTrigger>
-            <TabsTrigger value="SELL" className="data-[state=active]:bg-destructive data-[state=active]:text-destructive-foreground">
-              <TrendingDown className="w-4 h-4 mr-2" />
-              SELL
+            <TabsTrigger value="SELL" className="data-[state=active]:bg-destructive data-[state=active]:text-white">
+              <TrendingDown className="w-4 h-4 mr-2" /> SELL
             </TabsTrigger>
           </TabsList>
 
           <TabsContent value={side} className="space-y-4 mt-4">
+            {/* Order Type & Validity */}
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>Order Type</Label>
                 <Select value={orderType} onValueChange={(v) => setOrderType(v as OrderType)}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="MARKET">Market</SelectItem>
                     <SelectItem value="LIMIT">Limit</SelectItem>
@@ -124,139 +128,117 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
                   </SelectContent>
                 </Select>
               </div>
-
               <div className="space-y-2">
                 <Label>Validity</Label>
                 <Select value={validity} onValueChange={(v) => setValidity(v as OrderValidity)}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="INTRADAY">Intraday</SelectItem>
-                    <SelectItem value="OVERNIGHT">Overnight</SelectItem>
+                    <SelectItem value="INTRADAY">Intraday (expires 3:30 PM IST)</SelectItem>
+                    <SelectItem value="OVERNIGHT">Overnight (persists next day)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
             </div>
 
+            {/* Quantity */}
             <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label>Quantity</Label>
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="auto-qty" className="text-xs text-muted-foreground">
-                    Auto Calculate
-                  </Label>
-                  <Switch
-                    id="auto-qty"
-                    checked={autoQuantity}
-                    onCheckedChange={setAutoQuantity}
-                  />
-                </div>
-              </div>
-              
-              {autoQuantity ? (
-                <div className="flex gap-2">
-                  <Input
-                    type="number"
-                    placeholder="Percent"
-                    value={autoPercent}
-                    onChange={(e) => setAutoPercent(e.target.value)}
-                    className="flex-1"
-                  />
-                  <span className="flex items-center text-sm text-muted-foreground">
-                    = {calculateQuantity()} shares
-                  </span>
-                </div>
-              ) : (
-                <Input
-                  type="number"
-                  placeholder="Quantity"
-                  value={quantity}
-                  onChange={(e) => setQuantity(e.target.value)}
-                />
-              )}
+              <Label>Quantity</Label>
+              <Input
+                type="number"
+                min="1"
+                placeholder="Number of shares"
+                value={quantity}
+                onChange={(e) => setQuantity(e.target.value)}
+              />
             </div>
 
+            {/* Limit / Stop-Limit Price */}
             {orderType !== 'MARKET' && (
               <div className="space-y-2">
                 <Label>Price</Label>
                 <Input
                   type="number"
                   step="0.05"
-                  placeholder={`Price (Current: ₹${currentPrice.toFixed(2)})`}
+                  placeholder={`Limit price (LTP: ₹${currentPrice.toFixed(2)})`}
                   value={price}
                   onChange={(e) => setPrice(e.target.value)}
                 />
               </div>
             )}
 
+            {/* Stop Price */}
             {(orderType === 'STOP' || orderType === 'STOP_LIMIT') && (
               <div className="space-y-2">
-                <Label>Stop Price</Label>
+                <Label>Stop Trigger Price</Label>
                 <Input
                   type="number"
                   step="0.05"
-                  placeholder="Trigger Price"
+                  placeholder="Trigger price"
                   value={stopPrice}
                   onChange={(e) => setStopPrice(e.target.value)}
                 />
               </div>
             )}
 
+            {/* Target & Stop Loss */}
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Target Price (Optional)</Label>
+                <Label className="text-success">Target Price <span className="text-muted-foreground font-normal text-xs">(auto square-off)</span></Label>
                 <Input
                   type="number"
                   step="0.05"
-                  placeholder="Target"
+                  placeholder={`e.g. ₹${(currentPrice * (side === 'BUY' ? 1.05 : 0.95)).toFixed(0)}`}
                   value={targetPrice}
                   onChange={(e) => setTargetPrice(e.target.value)}
                 />
               </div>
-
               <div className="space-y-2">
-                <Label>Stop Loss (Optional)</Label>
+                <Label className="text-destructive">Stop Loss <span className="text-muted-foreground font-normal text-xs">(auto square-off)</span></Label>
                 <Input
                   type="number"
                   step="0.05"
-                  placeholder="Stop Loss"
+                  placeholder={`e.g. ₹${(currentPrice * (side === 'BUY' ? 0.97 : 1.03)).toFixed(0)}`}
                   value={stopLoss}
                   onChange={(e) => setStopLoss(e.target.value)}
                 />
               </div>
             </div>
 
-            <div className="p-4 bg-muted rounded-lg space-y-2">
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Quantity:</span>
-                <span className="font-medium">{effectiveQuantity}</span>
+            {/* Summary */}
+            <div className="p-4 bg-muted rounded-lg space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Qty × Price:</span>
+                <span className="font-medium">{qty} × ₹{effPrice.toFixed(2)}</span>
               </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Price:</span>
-                <span className="font-medium">₹{effectivePrice.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between text-sm">
+              <div className="flex justify-between">
                 <span className="text-muted-foreground">Order Value:</span>
-                <span className="font-medium">₹{totalValue.toFixed(2)}</span>
+                <span className="font-medium">₹{orderValue.toFixed(2)}</span>
               </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Est. Fees:</span>
-                <span className="font-medium">₹{estimatedFees.toFixed(2)}</span>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Est. Brokerage (0.1%):</span>
+                <span className="font-medium">₹{fees.toFixed(2)}</span>
               </div>
-              <div className="flex justify-between text-base font-bold pt-2 border-t">
+              <div className="flex justify-between font-bold pt-2 border-t text-base">
                 <span>Net Amount:</span>
-                <span>₹{netAmount.toFixed(2)}</span>
+                <span className={side === 'BUY' ? 'text-destructive' : 'text-success'}>
+                  {side === 'BUY' ? '-' : '+'}₹{netAmount.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between text-xs text-muted-foreground pt-1">
+                <span>Available Balance:</span>
+                <span>₹{displayBalance.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
               </div>
             </div>
 
             <Button
               className="w-full"
-              variant={side === 'BUY' ? 'default' : 'destructive'}
               size="lg"
+              disabled={loading || currentPrice === 0}
+              variant={side === 'BUY' ? 'default' : 'destructive'}
               onClick={handlePlaceOrder}
+              style={side === 'BUY' ? { backgroundColor: 'hsl(var(--success))', color: '#fff' } : undefined}
             >
-              {side} {effectiveQuantity} {symbol} @ ₹{effectivePrice.toFixed(2)}
+              {loading ? 'Placing Order…' : `${side} ${qty} ${symbol} @ ${orderType === 'MARKET' ? 'Market' : `₹${price || '—'}`}`}
             </Button>
           </TabsContent>
         </Tabs>

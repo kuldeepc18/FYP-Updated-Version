@@ -25,8 +25,7 @@ const SettingsPage = () => {
 
   const toggleTheme = () => {
     const newTheme = theme === 'dark' ? 'light' : 'dark';
-    dispatch(setTheme(newTheme));
-    document.documentElement.classList.toggle('dark');
+    dispatch(setTheme(newTheme)); // reducer handles localStorage + DOM class
     toast.success(`Switched to ${newTheme} mode`);
   };
 
@@ -65,7 +64,9 @@ const SettingsPage = () => {
             </div>
             <div>
               <Label className="text-muted-foreground text-xs">User ID</Label>
-              <p className="font-medium font-mono text-sm">{user?.id || 'demo-user-001'}</p>
+              <p className="font-medium font-mono text-sm">
+                {user?.numericId ?? user?.id ?? 'demo-user-001'}
+              </p>
             </div>
           </div>
           <div>

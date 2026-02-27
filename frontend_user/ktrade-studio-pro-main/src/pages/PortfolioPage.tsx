@@ -7,23 +7,35 @@ import { setSymbols } from '@/store/tradingSlice';
 import { marketDataService } from '@/services';
 import { cn } from '@/lib/utils';
 import { ArrowRight, TrendingUp, TrendingDown, Wallet, PieChart, BarChart3 } from 'lucide-react';
+import { Symbol } from '@/types/trading';
 
 const PortfolioPage = () => {
   const navigate = useNavigate();
   const dispatch = useAppDispatch();
   const { positions, account, symbols } = useAppSelector((state) => state.trading);
 
+  // ── Subscribe to real-time SSE stream for live LTP ────────────────────────
   useEffect(() => {
-    const loadSymbols = async () => {
-      const allSymbols = await marketDataService.getSymbols();
-      dispatch(setSymbols(allSymbols));
-    };
-    loadSymbols();
+    const onUpdate = (syms: Symbol[]) => dispatch(setSymbols(syms));
+    marketDataService.onMarketUpdate(onUpdate);
+    marketDataService.startRealtimeStream();
+    marketDataService.getSymbols().then(syms => { if (syms.length) dispatch(setSymbols(syms)); });
+    return () => marketDataService.offMarketUpdate(onUpdate);
   }, [dispatch]);
 
-  const totalInvested = positions.reduce((sum, p) => sum + (p.quantity * p.averagePrice), 0);
-  const totalCurrent = positions.reduce((sum, p) => sum + (p.quantity * p.currentPrice), 0);
-  const totalPnl = positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
+  // Compute live P&L using SSE LTP instead of stale position.currentPrice
+  const livePositions = positions.map(p => {
+    const ltp = symbols.find(s => s.symbol === p.symbol)?.price ?? p.currentPrice;
+    const pnl = p.side === 'BUY'
+      ? (ltp - p.averagePrice) * p.quantity
+      : (p.averagePrice - ltp) * p.quantity;
+    const pnlPct = p.averagePrice > 0 ? (pnl / (p.averagePrice * p.quantity)) * 100 : 0;
+    return { ...p, currentPrice: ltp, unrealizedPnl: pnl, unrealizedPnlPercent: pnlPct };
+  });
+
+  const totalInvested = livePositions.reduce((sum, p) => sum + (p.quantity * p.averagePrice), 0);
+  const totalCurrent  = livePositions.reduce((sum, p) => sum + (p.quantity * p.currentPrice), 0);
+  const totalPnl      = livePositions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
   const totalPnlPercent = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
 
   const formatCurrency = (value: number) => {
@@ -111,9 +123,9 @@ const PortfolioPage = () => {
       {/* Holdings */}
       <Card>
         <div className="p-4 border-b">
-          <h2 className="font-semibold">Holdings ({positions.length})</h2>
+          <h2 className="font-semibold">Holdings ({livePositions.length})</h2>
         </div>
-        {positions.length === 0 ? (
+        {livePositions.length === 0 ? (
           <div className="p-8 text-center text-muted-foreground">
             <p>No holdings yet</p>
             <p className="text-sm mt-1">Start trading to build your portfolio</p>
@@ -123,7 +135,7 @@ const PortfolioPage = () => {
           </div>
         ) : (
           <div className="divide-y">
-            {positions.map((position) => {
+            {livePositions.map((position) => {
               const symData = symbols.find((s) => s.symbol === position.symbol);
               const isPositive = position.unrealizedPnl >= 0;
 

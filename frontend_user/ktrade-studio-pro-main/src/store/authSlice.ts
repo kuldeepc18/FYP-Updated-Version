@@ -1,7 +1,8 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 
-interface User {
+export interface User {
   id: string;
+  numericId?: number | null;
   email: string;
   name: string;
   balance: number;
@@ -33,8 +34,22 @@ const authSlice = createSlice({
       state.token = null;
       state.isAuthenticated = false;
     },
+    updateUserBalance: (state, action: PayloadAction<number>) => {
+      if (state.user) {
+        state.user = { ...state.user, balance: action.payload };
+        // Persist the updated balance into localStorage so it survives a page refresh
+        try {
+          const stored = localStorage.getItem('ktrade_auth');
+          if (stored) {
+            const parsed = JSON.parse(stored);
+            parsed.user = { ...parsed.user, balance: action.payload };
+            localStorage.setItem('ktrade_auth', JSON.stringify(parsed));
+          }
+        } catch {}
+      }
+    },
   },
 });
 
-export const { setAuth, clearAuth } = authSlice.actions;
+export const { setAuth, clearAuth, updateUserBalance } = authSlice.actions;
 export default authSlice.reducer;

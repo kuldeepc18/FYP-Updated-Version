@@ -1,11 +1,23 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { Symbol, Order, Position, MarketDepth, OHLCV, Watchlist, Account } from '@/types/trading';
+import { Symbol, Order, Position, MarketDepth, OHLCV, Watchlist, Account, Trade } from '@/types/trading';
+
+export interface MyTrade {
+  symbol: string;
+  name: string;
+  quantity: number;
+  averagePrice: number;
+  avgSellPrice: number;
+  pnl: number;
+  pnlPercent: number;
+  timestamp: number;
+}
 
 interface TradingState {
   selectedSymbol: string;
   symbols: Symbol[];
   orders: Order[];
   positions: Position[];
+  myTrades: MyTrade[];
   watchlists: Watchlist[];
   activeWatchlist: string;
   marketDepth: MarketDepth | null;
@@ -16,14 +28,20 @@ interface TradingState {
 const DEFAULT_WATCHLIST: Watchlist = {
   id: 'default',
   name: 'My Watchlist',
-  symbols: ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK'],
+  symbols: ['RELIANCE (NSE)', 'TCS (NSE)', 'HDFCBANK (NSE)', 'TATAMOTORS (NSE)', 'ADANIENT (NSE)'],
 };
+
+// Restore theme from localStorage so it survives page refreshes
+const _savedTheme = (typeof window !== 'undefined'
+  ? localStorage.getItem('ktrade_theme')
+  : null) as 'light' | 'dark' | null;
 
 const initialState: TradingState = {
   selectedSymbol: 'RELIANCE',
   symbols: [],
   orders: [],
   positions: [],
+  myTrades: [],
   watchlists: [DEFAULT_WATCHLIST],
   activeWatchlist: 'default',
   marketDepth: null,
@@ -35,7 +53,7 @@ const initialState: TradingState = {
     unrealizedPnl: 0,
     realizedPnl: 0,
   },
-  theme: 'dark',
+  theme: _savedTheme || 'dark',
 };
 
 const tradingSlice = createSlice({
@@ -74,6 +92,9 @@ const tradingSlice = createSlice({
     },
     setPositions: (state, action: PayloadAction<Position[]>) => {
       state.positions = action.payload;
+    },
+    setMyTrades: (state, action: PayloadAction<MyTrade[]>) => {
+      state.myTrades = action.payload;
     },
     updatePosition: (state, action: PayloadAction<Position>) => {
       const index = state.positions.findIndex(p => p.symbol === action.payload.symbol);
@@ -114,6 +135,12 @@ const tradingSlice = createSlice({
     },
     setTheme: (state, action: PayloadAction<'light' | 'dark'>) => {
       state.theme = action.payload;
+      // Persist so that page refreshes and new tabs start with the correct theme
+      try { localStorage.setItem('ktrade_theme', action.payload); } catch {}
+      // Apply immediately to document so every page reflects the change
+      if (typeof document !== 'undefined') {
+        document.documentElement.classList.toggle('dark', action.payload === 'dark');
+      }
     },
     resetDemo: (state) => {
       state.orders = [];
@@ -139,6 +166,7 @@ export const {
   updateOrder,
   cancelOrder,
   setPositions,
+  setMyTrades,
   updatePosition,
   setMarketDepth,
   addToWatchlist,

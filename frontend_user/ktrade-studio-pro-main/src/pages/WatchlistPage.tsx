@@ -19,12 +19,14 @@ const WatchlistPage = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Symbol[]>([]);
 
+  // ── Subscribe to real-time SSE stream (same singleton as Trade/Dashboard) ──
   useEffect(() => {
-    const loadSymbols = async () => {
-      const allSymbols = await marketDataService.getSymbols();
-      dispatch(setSymbols(allSymbols));
-    };
-    loadSymbols();
+    const onUpdate = (syms: Symbol[]) => dispatch(setSymbols(syms));
+    marketDataService.onMarketUpdate(onUpdate);
+    marketDataService.startRealtimeStream();
+    // Initial fetch so prices show immediately on mount
+    marketDataService.getSymbols().then(syms => { if (syms.length) dispatch(setSymbols(syms)); });
+    return () => marketDataService.offMarketUpdate(onUpdate);
   }, [dispatch]);
 
   useEffect(() => {

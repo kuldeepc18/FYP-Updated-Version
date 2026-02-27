@@ -1,5 +1,6 @@
 // Export API-based services (connected to backend)
 export { marketDataService } from './marketDataApi';
+export { orderServiceApi } from './orderServiceApi';
 export { orderServiceApi as orderService } from './orderServiceApi';
 export { websocketService } from './websocketApi';
 

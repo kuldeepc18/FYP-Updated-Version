@@ -12,8 +12,8 @@ import { toast } from 'sonner';
 const Login = () => {
   const navigate = useNavigate();
   const dispatch = useAppDispatch();
-  const [email, setEmail] = useState('demo@ktrade.test');
-  const [password, setPassword] = useState('demo123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -24,7 +24,7 @@ const Login = () => {
       console.log('Attempting login with:', email);
       const authState = await authService.login(email, password);
       console.log('Login successful:', authState);
-      dispatch(setAuth(authState));
+      dispatch(setAuth({ user: authState.user!, token: authState.token! }));
       toast.success('Login successful!');
       navigate('/');
     } catch (error: any) {
@@ -57,7 +57,7 @@ const Login = () => {
               <Input
                 id="email"
                 type="email"
-                placeholder="demo@ktrade.test"
+                placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
@@ -68,16 +68,11 @@ const Login = () => {
               <Input
                 id="password"
                 type="password"
-                placeholder="demo123"
+                placeholder="Enter your password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
               />
-            </div>
-            <div className="bg-muted p-3 rounded-lg text-sm">
-              <p className="font-medium mb-1">Demo Credentials:</p>
-              <p className="text-muted-foreground">Email: demo@ktrade.test</p>
-              <p className="text-muted-foreground">Password: demo123</p>
             </div>
           </CardContent>
           <CardFooter className="flex flex-col gap-4">

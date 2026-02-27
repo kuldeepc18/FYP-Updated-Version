@@ -25,9 +25,9 @@ const Register = () => {
       console.log('Attempting registration with:', email, name);
       const authState = await authService.register(email, password, name);
       console.log('Registration successful:', authState);
-      dispatch(setAuth(authState));
-      toast.success('Registration successful! You can now login.');
-      navigate('/auth/login');
+      dispatch(setAuth({ user: authState.user!, token: authState.token! }));
+      toast.success('Account created! Welcome to KTrade Studio.');
+      navigate('/');
     } catch (error: any) {
       console.error('Registration error:', error);
       toast.error(error.message || 'Registration failed. Please try again.');

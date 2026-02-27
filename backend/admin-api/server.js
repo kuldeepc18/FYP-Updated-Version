@@ -10,10 +10,85 @@ const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const cors    = require('cors');
 const http    = require('http'); // for loopback engine requests
+const fs      = require('fs');
+const path    = require('path');
+const crypto  = require('crypto');
 
-const QUESTDB_URL = 'http://127.0.0.1:9000/exec';
-const JWT_SECRET  = 'ktrade_admin_jwt_secret_2026';
-const PORT        = 3000;
+const QUESTDB_URL    = 'http://127.0.0.1:9000/exec';
+const JWT_SECRET     = 'ktrade_admin_jwt_secret_2026';
+const USER_JWT_SECRET = 'ktrade_user_jwt_secret_2026';
+const PORT           = 3000;
+
+// ─── User data store (file-based, persists across restarts) ──────────────────
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+function readUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function findUserByEmail(email) {
+  return readUsers().find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
+}
+
+function findUserById(id) {
+  return readUsers().find(u => u.id === id) || null;
+}
+
+// ─── User Orders Store (file-based — paper-trading engine) ───────────────────
+const USER_ORDERS_FILE = path.join(__dirname, 'user_orders.json');
+
+function readUserOrders() {
+  try {
+    if (!fs.existsSync(USER_ORDERS_FILE)) return [];
+    return JSON.parse(fs.readFileSync(USER_ORDERS_FILE, 'utf8'));
+  } catch { return []; }
+}
+
+function writeUserOrders(orders) {
+  fs.writeFileSync(USER_ORDERS_FILE, JSON.stringify(orders, null, 2), 'utf8');
+}
+
+// Compute net open positions for a user from their FILLED orders
+function computeUserPositions(userId, priceMap) {
+  const orders = readUserOrders().filter(
+    o => o.userId === userId && o.status === 'FILLED' && o.filledQuantity > 0
+  );
+  const posMap = {};
+  orders.forEach(o => {
+    if (!posMap[o.symbol]) posMap[o.symbol] = { symbol: o.symbol, name: o.name, buyQty: 0, sellQty: 0, buyValue: 0, sellValue: 0 };
+    if (o.side === 'BUY') {
+      posMap[o.symbol].buyQty   += o.filledQuantity;
+      posMap[o.symbol].buyValue += o.filledQuantity * (o.averagePrice || o.price || 0);
+    } else {
+      posMap[o.symbol].sellQty   += o.filledQuantity;
+      posMap[o.symbol].sellValue += o.filledQuantity * (o.averagePrice || o.price || 0);
+    }
+  });
+  return Object.values(posMap).map(pos => {
+    const netQty = pos.buyQty - pos.sellQty;
+    if (Math.abs(netQty) < 0.0001) return null;
+    const side      = netQty > 0 ? 'BUY' : 'SELL';
+    const absQty    = Math.abs(netQty);
+    const avgPrice  = netQty > 0
+      ? (pos.buyQty  > 0 ? pos.buyValue  / pos.buyQty  : 0)
+      : (pos.sellQty > 0 ? pos.sellValue / pos.sellQty : 0);
+    const currentPrice = priceMap[pos.symbol] || avgPrice;
+    const unrealizedPnl = netQty > 0
+      ? (currentPrice - avgPrice) * absQty
+      : (avgPrice - currentPrice) * absQty;
+    const unrealizedPnlPercent = avgPrice > 0 ? (unrealizedPnl / (avgPrice * absQty)) * 100 : 0;
+    return { symbol: pos.symbol, name: pos.name, quantity: absQty, side, averagePrice: avgPrice, currentPrice, unrealizedPnl, unrealizedPnlPercent, timestamp: Date.now() };
+  }).filter(Boolean);
+}
 
 const app = express();
 app.use(cors());
@@ -89,7 +164,605 @@ app.post('/api/admin/auth/login', async (req, res) => {
 
 app.post('/api/admin/auth/logout', requireAuth, (_req, res) => res.json({ ok: true }));
 
-// ─── Market Data ─────────────────────────────────────────────────────────────
+// ─── User Auth Middleware ────────────────────────────────────────────────────
+function requireUserAuth(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    req.user = jwt.verify(token, USER_JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// ─── User Auth Endpoints ─────────────────────────────────────────────────────
+
+// POST /api/auth/register
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, name } = req.body || {};
+  if (!email || !password || !name) {
+    return res.status(400).json({ message: 'email, password and name are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  }
+  try {
+    const existing = findUserByEmail(email);
+    if (existing) {
+      return res.status(409).json({ message: 'An account with this email already exists' });
+    }
+    const password_hash = await bcrypt.hash(password, 12);
+    // Assign sequential numeric user IDs starting at 10001
+    // (IDs 1–10000 are reserved for mock/system traders)
+    const allUsers = readUsers();
+    const maxNumericId = allUsers.reduce((max, u) => {
+      const n = typeof u.numericId === 'number' ? u.numericId : 0;
+      return n > max ? n : max;
+    }, 10000);
+    const numericId = maxNumericId + 1;
+    const newUser = {
+      id: String(numericId),
+      numericId,
+      email: email.toLowerCase().trim(),
+      name: name.trim(),
+      password_hash,
+      balance: 100000,
+      total_trades_placed: 0,
+      created_at: new Date().toISOString(),
+    };
+    allUsers.push(newUser);
+    writeUsers(allUsers);
+
+    const token = jwt.sign(
+      { id: newUser.id, email: newUser.email, role: 'user' },
+      USER_JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    res.status(201).json({
+      token,
+      user: {
+        id: newUser.id,
+        numericId: newUser.numericId,
+        email: newUser.email,
+        name: newUser.name,
+        balance: newUser.balance,
+      },
+    });
+  } catch (err) {
+    console.error('[User Register]', err.message);
+    res.status(500).json({ message: 'Registration failed. Please try again.' });
+  }
+});
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ message: 'email and password are required' });
+  }
+  try {
+    const user = findUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: 'user' },
+      USER_JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        numericId: user.numericId || null,
+        email: user.email,
+        name: user.name,
+        balance: user.balance,
+      },
+    });
+  } catch (err) {
+    console.error('[User Login]', err.message);
+    res.status(500).json({ message: 'Login failed. Please try again.' });
+  }
+});
+
+// POST /api/auth/logout
+app.post('/api/auth/logout', (_req, res) => res.json({ ok: true }));
+
+// GET /api/auth/me
+app.get('/api/auth/me', requireUserAuth, (req, res) => {
+  try {
+    const user = findUserById(req.user.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({
+      id: user.id,
+      numericId: user.numericId || null,
+      email: user.email,
+      name: user.name,
+      balance: user.balance,
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch user' });
+  }
+});
+
+// ─── User-facing Market Data (no auth required — public quotes) ──────────────
+
+// Shared helper: fetch latest 24h instrument stats from QuestDB
+async function fetchMarketQuotes() {
+  const stats = await questdb(`
+    SELECT
+      split_part(order_id, '-', 1) AS instrument_id,
+      first(price)                 AS price_at_start,
+      last(price)                  AS last_price,
+      max(price)                   AS high24h,
+      min(price)                   AS low24h,
+      sum(quantity)                AS total_volume_qty
+    FROM trade_logs
+    WHERE timestamp > dateadd('h', -24, now())
+    GROUP BY instrument_id
+  `);
+
+  const priceMap = {};
+  stats.forEach(row => { priceMap[row.instrument_id] = row; });
+
+  return Object.values(INSTRUMENTS).map(inst => {
+    const row       = priceMap[inst.id];
+    const lastPrice  = row?.last_price   ?? inst.basePrice;
+    const startPrice = row?.price_at_start ?? inst.basePrice;
+    const change     = lastPrice - startPrice;
+    const changePct  = startPrice ? (change / startPrice) * 100 : 0;
+    return {
+      id           : inst.id,
+      symbol       : inst.symbol,
+      name         : inst.name,
+      marketPrice  : lastPrice,
+      change       : change,
+      changePercent: changePct,
+      high24h      : row?.high24h ?? lastPrice,
+      low24h       : row?.low24h  ?? lastPrice,
+      volume       : row?.total_volume_qty ?? 0,
+    };
+  });
+}
+
+// GET /api/market/quotes
+app.get('/api/market/quotes', async (_req, res) => {
+  try {
+    const result = await fetchMarketQuotes();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/market/quotes/stream  — SSE, pushes fresh quotes every 2 s
+app.get('/api/market/quotes/stream', (req, res) => {
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let closed = false;
+  req.on('close', () => { closed = true; clearInterval(iv); });
+
+  async function push() {
+    if (closed) return;
+    try {
+      const result = await fetchMarketQuotes();
+      if (!closed) res.write(`data: ${JSON.stringify(result)}\n\n`);
+    } catch (err) {
+      if (!closed) res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    }
+  }
+
+  push();
+  const iv = setInterval(push, 2000);
+});
+
+// ─── User-facing Order Book (no auth required) ───────────────────────────────
+
+function resolveInstrument(raw) {
+  const byId = INSTRUMENTS[parseInt(raw, 10)];
+  if (byId) return byId;
+  const cleaned = raw.replace(/\s/g, '').toLowerCase();
+  return Object.values(INSTRUMENTS).find(i =>
+    i.symbol.replace(/\s/g, '').toLowerCase() === cleaned || i.id === raw
+  ) || null;
+}
+
+// GET /api/market/orderbook/:instrumentId
+app.get('/api/market/orderbook/:instrumentId', async (req, res) => {
+  const inst = resolveInstrument(req.params.instrumentId);
+  if (!inst) return res.status(404).json({ error: 'Unknown instrument' });
+  try {
+    let bids, asks;
+    try {
+      const eb = await fetchBookFromEngine(inst.id);
+      bids = eb.bids; asks = eb.asks;
+    } catch {
+      const qb = await fetchBookFromQuestDB(inst.id);
+      bids = qb.bids; asks = qb.asks;
+    }
+    res.json({
+      symbol: inst.symbol, name: inst.name,
+      bids: bids.map(b => ({ price: b.price, quantity: b.qty_buyers  || b.quantity || 0, orders: b.order_count || 1 })),
+      asks: asks.map(a => ({ price: a.price, quantity: a.qty_sellers || a.quantity || 0, orders: a.order_count || 1 })),
+      lastUpdate: Date.now(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/market/orderbook/:instrumentId/stream — SSE, no auth
+app.get('/api/market/orderbook/:instrumentId/stream', (req, res) => {
+  const inst = resolveInstrument(req.params.instrumentId);
+  if (!inst) { res.status(404).end(); return; }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  let closed = false;
+  req.on('close', () => { closed = true; clearInterval(iv); });
+  async function sendBook() {
+    if (closed) return;
+    try {
+      let bids, asks;
+      try { const eb = await fetchBookFromEngine(inst.id); bids = eb.bids; asks = eb.asks; }
+      catch { const qb = await fetchBookFromQuestDB(inst.id); bids = qb.bids; asks = qb.asks; }
+      if (closed) return;
+      res.write(`data: ${JSON.stringify({
+        symbol: inst.symbol, name: inst.name,
+        bids: bids.map(b => ({ price: b.price, quantity: b.qty_buyers  || b.quantity || 0, orders: b.order_count || 1 })),
+        asks: asks.map(a => ({ price: a.price, quantity: a.qty_sellers || a.quantity || 0, orders: a.order_count || 1 })),
+        lastUpdate: Date.now(),
+      })}\n\n`);
+    } catch (err) { if (!closed) res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`); }
+  }
+  sendBook();
+  const iv = setInterval(sendBook, 400);
+});
+
+// ─── User Balance Management ─────────────────────────────────────────────────
+
+// POST /api/user/balance/add
+app.post('/api/user/balance/add', requireUserAuth, (req, res) => {
+  const amount = parseFloat(req.body?.amount);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ message: 'A positive amount is required' });
+  }
+  try {
+    const users = readUsers();
+    const idx = users.findIndex(u => u.id === req.user.id);
+    if (idx === -1) return res.status(404).json({ message: 'User not found' });
+    users[idx].balance = (users[idx].balance || 0) + amount;
+    writeUsers(users);
+    res.json({ balance: users[idx].balance, added: amount });
+  } catch (err) {
+    console.error('[Balance Add]', err.message);
+    res.status(500).json({ message: 'Failed to update balance' });
+  }
+});
+
+// POST /api/user/balance/withdraw
+app.post('/api/user/balance/withdraw', requireUserAuth, (req, res) => {
+  const amount = parseFloat(req.body?.amount);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ message: 'A positive amount is required' });
+  }
+  try {
+    const users = readUsers();
+    const idx = users.findIndex(u => u.id === req.user.id);
+    if (idx === -1) return res.status(404).json({ message: 'User not found' });
+    const current = users[idx].balance || 0;
+    if (amount > current) {
+      return res.status(400).json({
+        message: `Insufficient balance. Available: ₹${current.toFixed(2)}`,
+      });
+    }
+    users[idx].balance = current - amount;
+    writeUsers(users);
+    res.json({ balance: users[idx].balance, withdrawn: amount });
+  } catch (err) {
+    console.error('[Balance Withdraw]', err.message);
+    res.status(500).json({ message: 'Failed to update balance' });
+  }
+});
+
+// ─── User Orders & Positions ─────────────────────────────────────────────────
+
+// POST /api/user/orders — place a new order (paper trading)
+app.post('/api/user/orders', requireUserAuth, async (req, res) => {
+  const userId = req.user.id;
+  const { symbol, side, orderType, validity, quantity, price, stopPrice, targetPrice, stopLoss } = req.body;
+  if (!symbol || !side || !orderType || !quantity) return res.status(400).json({ error: 'symbol, side, orderType, quantity required' });
+  if (!['BUY','SELL'].includes(side))                          return res.status(400).json({ error: 'side must be BUY or SELL' });
+  if (!['MARKET','LIMIT','STOP','STOP_LIMIT'].includes(orderType)) return res.status(400).json({ error: 'Invalid orderType' });
+  if (!['INTRADAY','OVERNIGHT'].includes(validity || 'INTRADAY')) return res.status(400).json({ error: 'validity must be INTRADAY or OVERNIGHT' });
+  if (parseInt(quantity, 10) <= 0) return res.status(400).json({ error: 'quantity must be positive' });
+  const user = findUserById(userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === symbol);
+  // For BUY orders: validate + hold balance immediately
+  if (side === 'BUY') {
+    let estPrice = price ? parseFloat(price) : null;
+    if (!estPrice) {
+      try {
+        const quotes = await fetchMarketQuotes();
+        const q = quotes.find(q => q.symbol === symbol);
+        estPrice = q ? q.marketPrice : (instEntry ? instEntry.basePrice : null);
+      } catch {}
+    }
+    if (!estPrice) return res.status(400).json({ error: 'Cannot determine price for symbol' });
+    const requiredFunds = parseInt(quantity, 10) * estPrice * 1.002;
+    if ((user.balance || 0) < requiredFunds) {
+      return res.status(400).json({ error: `Insufficient balance. Required: \u20b9${requiredFunds.toFixed(2)}, Available: \u20b9${(user.balance || 0).toFixed(2)}` });
+    }
+    const users = readUsers();
+    const idx   = users.findIndex(u => u.id === userId);
+    if (idx !== -1) { users[idx].balance -= requiredFunds; writeUsers(users); }
+  }
+  const order = {
+    id            : crypto.randomUUID(),
+    userId,
+    symbol,
+    name          : instEntry?.name || symbol,
+    side,
+    orderType,
+    validity      : validity || 'INTRADAY',
+    quantity      : parseInt(quantity, 10),
+    price         : price     ? parseFloat(price)      : null,
+    stopPrice     : stopPrice ? parseFloat(stopPrice)  : null,
+    targetPrice   : targetPrice ? parseFloat(targetPrice) : null,
+    stopLoss      : stopLoss  ? parseFloat(stopLoss)   : null,
+    status        : 'PENDING',
+    filledQuantity: 0,
+    averagePrice  : null,
+    fees          : 0,
+    timestamp     : Date.now(),
+    fillTimestamp : null,
+    expiredAt     : null,
+    isAutoOrder   : false,
+  };
+  const orders = readUserOrders();
+  orders.unshift(order);
+  writeUserOrders(orders);
+  res.status(201).json({ ...order, type: order.orderType });
+});
+
+// DELETE /api/user/orders/:id — cancel a pending order
+app.delete('/api/user/orders/:id', requireUserAuth, (req, res) => {
+  const userId  = req.user.id;
+  const orderId = req.params.id;
+  const orders  = readUserOrders();
+  const idx     = orders.findIndex(o => o.id === orderId && o.userId === userId);
+  if (idx === -1) return res.status(404).json({ error: 'Order not found' });
+  const order = orders[idx];
+  if (order.status !== 'PENDING' && order.status !== 'PARTIAL') return res.status(400).json({ error: 'Only PENDING/PARTIAL orders can be cancelled' });
+  // Refund held balance for BUY orders
+  if (order.side === 'BUY') {
+    const users = readUsers();
+    const uidx  = users.findIndex(u => u.id === userId);
+    if (uidx !== -1) {
+      const refund = order.quantity * (order.price || 0) * 1.002;
+      users[uidx].balance = (users[uidx].balance || 0) + refund;
+      writeUsers(users);
+    }
+  }
+  orders[idx].status      = 'CANCELLED';
+  orders[idx].cancelledAt = Date.now();
+  writeUserOrders(orders);
+  res.json({ ok: true, id: orderId });
+});
+
+// GET /api/user/orders — file-based, all orders for authenticated user
+app.get('/api/user/orders', requireUserAuth, (req, res) => {
+  const userId = req.user.id;
+  const orders = readUserOrders()
+    .filter(o => o.userId === userId)
+    .map(o => ({
+      id             : o.id,
+      symbol         : o.symbol,
+      name           : o.name,
+      side           : o.side,
+      type           : o.orderType,
+      orderType      : o.orderType,
+      quantity       : o.quantity,
+      price          : o.price,
+      stopPrice      : o.stopPrice,
+      targetPrice    : o.targetPrice,
+      stopLoss       : o.stopLoss,
+      filledQuantity : o.filledQuantity,
+      averagePrice   : o.averagePrice,
+      status         : o.status,
+      validity       : o.validity,
+      fees           : o.fees,
+      timestamp      : o.timestamp,
+      fillTimestamp  : o.fillTimestamp,
+      isAutoOrder    : o.isAutoOrder,
+      autoReason     : o.autoReason,
+    }));
+  res.json(orders);
+});
+
+// GET /api/user/mytrades — squared-off round trips with realized P&L
+app.get('/api/user/mytrades', requireUserAuth, (req, res) => {
+  const userId = req.user.id;
+  const filled = readUserOrders().filter(o => o.userId === userId && o.status === 'FILLED' && o.filledQuantity > 0);
+  const symMap = {};
+  filled.forEach(o => {
+    if (!symMap[o.symbol]) symMap[o.symbol] = { name: o.name, buys: [], sells: [] };
+    if (o.side === 'BUY') symMap[o.symbol].buys.push(o);
+    else symMap[o.symbol].sells.push(o);
+  });
+  const trades = [];
+  Object.entries(symMap).forEach(([symbol, { name, buys, sells }]) => {
+    if (!buys.length || !sells.length) return;
+    const totalBuyQty  = buys.reduce((s, o)  => s + o.filledQuantity, 0);
+    const totalSellQty = sells.reduce((s, o) => s + o.filledQuantity, 0);
+    const squaredQty   = Math.min(totalBuyQty, totalSellQty);
+    if (squaredQty <= 0) return;
+    const avgBuy  = buys.reduce((s, o)  => s + o.averagePrice * o.filledQuantity, 0) / totalBuyQty;
+    const avgSell = sells.reduce((s, o) => s + o.averagePrice * o.filledQuantity, 0) / totalSellQty;
+    const pnl     = (avgSell - avgBuy) * squaredQty;
+    const pnlPct  = avgBuy > 0 ? (pnl / (avgBuy * squaredQty)) * 100 : 0;
+    trades.push({ symbol, name, quantity: squaredQty, averagePrice: avgBuy, avgSellPrice: avgSell, pnl, pnlPercent: pnlPct, timestamp: (sells[sells.length - 1].fillTimestamp || Date.now()) });
+  });
+  res.json(trades.sort((a, b) => b.timestamp - a.timestamp));
+});
+
+// GET /api/user/positions — file-based net positions with live prices
+app.get('/api/user/positions', requireUserAuth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    let quotes = [];
+    try { quotes = await fetchMarketQuotes(); } catch {}
+    const priceMap = {};
+    quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
+    const positions = computeUserPositions(userId, priceMap);
+    res.json(positions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/user/positions/exit — exit a single position at market price
+app.post('/api/user/positions/exit', requireUserAuth, async (req, res) => {
+  const userId = req.user.id;
+  const { symbol } = req.body;
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+  try {
+    let quotes = [];
+    try { quotes = await fetchMarketQuotes(); } catch {}
+    const priceMap = {};
+    quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
+    const positions = computeUserPositions(userId, priceMap);
+    const pos = positions.find(p => p.symbol === symbol);
+    if (!pos) return res.status(404).json({ error: 'No open position for this symbol' });
+    const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
+    const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === symbol);
+    const currentPrice = priceMap[symbol] || pos.averagePrice;
+    // For SELL exit of a BUY position: no upfront balance needed
+    // For BUY exit of a SELL position: validate + hold funds
+    if (exitSide === 'BUY') {
+      const requiredFunds = pos.quantity * currentPrice * 1.002;
+      const user = findUserById(userId);
+      if (!user || (user.balance || 0) < requiredFunds) {
+        return res.status(400).json({ error: `Insufficient balance to close SHORT position` });
+      }
+      const users = readUsers();
+      const uidx  = users.findIndex(u => u.id === userId);
+      if (uidx !== -1) { users[uidx].balance -= requiredFunds; writeUsers(users); }
+    }
+    const order = {
+      id            : crypto.randomUUID(),
+      userId,
+      symbol,
+      name          : instEntry?.name || pos.name || symbol,
+      side          : exitSide,
+      orderType     : 'MARKET',
+      validity      : 'INTRADAY',
+      quantity      : pos.quantity,
+      price         : null,
+      stopPrice     : null,
+      targetPrice   : null,
+      stopLoss      : null,
+      status        : 'PENDING',
+      filledQuantity: 0,
+      averagePrice  : null,
+      fees          : 0,
+      timestamp     : Date.now(),
+      fillTimestamp : null,
+      expiredAt     : null,
+      isAutoOrder   : true,
+      autoReason    : 'USER_EXIT',
+    };
+    const orders = readUserOrders();
+    orders.unshift(order);
+    writeUserOrders(orders);
+    res.json({ ok: true, orderId: order.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/user/positions/exit-all — exit all open positions at market
+app.post('/api/user/positions/exit-all', requireUserAuth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    let quotes = [];
+    try { quotes = await fetchMarketQuotes(); } catch {}
+    const priceMap = {};
+    quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
+    const positions = computeUserPositions(userId, priceMap);
+    if (!positions.length) return res.json({ ok: true, exited: 0 });
+    const orders = readUserOrders();
+    const now = Date.now();
+    for (const pos of positions) {
+      const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
+      const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === pos.symbol);
+      if (exitSide === 'BUY') {
+        const currentPrice = priceMap[pos.symbol] || pos.averagePrice;
+        const requiredFunds = pos.quantity * currentPrice * 1.002;
+        const users = readUsers();
+        const uidx  = users.findIndex(u => u.id === userId);
+        if (uidx !== -1 && (users[uidx].balance || 0) >= requiredFunds) {
+          users[uidx].balance -= requiredFunds;
+          writeUsers(users);
+        }
+      }
+      orders.unshift({
+        id            : crypto.randomUUID(),
+        userId,
+        symbol        : pos.symbol,
+        name          : instEntry?.name || pos.name || pos.symbol,
+        side          : exitSide,
+        orderType     : 'MARKET',
+        validity      : 'INTRADAY',
+        quantity      : pos.quantity,
+        price         : null,
+        stopPrice     : null,
+        targetPrice   : null,
+        stopLoss      : null,
+        status        : 'PENDING',
+        filledQuantity: 0,
+        averagePrice  : null,
+        fees          : 0,
+        timestamp     : now,
+        fillTimestamp : null,
+        expiredAt     : null,
+        isAutoOrder   : true,
+        autoReason    : 'USER_EXIT_ALL',
+      });
+    }
+    writeUserOrders(orders);
+    res.json({ ok: true, exited: positions.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/user/orders/:id — update targetPrice and/or stopLoss on a FILLED order
+app.patch('/api/user/orders/:id', requireUserAuth, (req, res) => {
+  const userId  = req.user.id;
+  const orderId = req.params.id;
+  const { targetPrice, stopLoss } = req.body;
+  const orders = readUserOrders();
+  const idx    = orders.findIndex(o => o.id === orderId && o.userId === userId);
+  if (idx === -1) return res.status(404).json({ error: 'Order not found' });
+  if (targetPrice !== undefined) orders[idx].targetPrice = targetPrice ? parseFloat(targetPrice) : null;
+  if (stopLoss    !== undefined) orders[idx].stopLoss    = stopLoss    ? parseFloat(stopLoss)    : null;
+  writeUserOrders(orders);
+  res.json({ ok: true, order: orders[idx] });
+});
+
+// ─── Market Data (Admin) ─────────────────────────────────────────────────────
 
 /**
  * GET /api/admin/market/symbols
@@ -465,6 +1138,149 @@ app.get('/api/admin/users', requireAuth, async (_req, res) => {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/admin/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }));
+
+// ─── Background Paper-Trading Matching Loop ──────────────────────────────────
+// Runs every 1 second. Fills PENDING user orders against live QuestDB prices,
+// triggers target/SL auto square-offs, and expires INTRADAY orders at 3:30 PM IST.
+async function runMatchingLoop() {
+  try {
+    const orders = readUserOrders();
+    if (!orders.length) return;
+    let quotes = [];
+    try { quotes = await fetchMarketQuotes(); } catch { return; }
+    const priceMap = {};
+    quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
+
+    const nowIST       = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const minOfDay     = nowIST.getHours() * 60 + nowIST.getMinutes();
+    const pastCutoff   = minOfDay >= 15 * 60 + 30; // 3:30 PM IST
+
+    let changed        = false;
+    const newAutoOrders = [];
+
+    orders.forEach(order => {
+      if (order.status !== 'PENDING' && order.status !== 'PARTIAL') return;
+      const currentPrice = priceMap[order.symbol];
+      if (!currentPrice) return;
+
+      // Intraday expiry at 3:30 PM IST — overnight stays PENDING overnight
+      if (order.validity === 'INTRADAY' && pastCutoff) {
+        order.status    = 'EXPIRED';
+        order.expiredAt = Date.now();
+        // Refund held balance for BUY
+        if (order.side === 'BUY') {
+          const users = readUsers();
+          const idx   = users.findIndex(u => u.id === order.userId);
+          if (idx !== -1) { users[idx].balance = (users[idx].balance || 0) + order.quantity * (order.price || currentPrice) * 1.002; writeUsers(users); }
+        }
+        changed = true;
+        return;
+      }
+
+      // Fill conditions
+      let shouldFill = false;
+      let fillPrice  = currentPrice;
+      if (order.orderType === 'MARKET') {
+        shouldFill = true;
+      } else if (order.orderType === 'LIMIT') {
+        if (order.side === 'BUY'  && currentPrice <= order.price) { shouldFill = true; fillPrice = order.price; }
+        if (order.side === 'SELL' && currentPrice >= order.price) { shouldFill = true; fillPrice = order.price; }
+      } else if (order.orderType === 'STOP' || order.orderType === 'STOP_LIMIT') {
+        if (order.side === 'BUY'  && currentPrice >= order.stopPrice) { shouldFill = true; }
+        if (order.side === 'SELL' && currentPrice <= order.stopPrice) { shouldFill = true; }
+      }
+
+      if (shouldFill) {
+        order.status         = 'FILLED';
+        order.filledQuantity = order.quantity;
+        order.averagePrice   = fillPrice;
+        order.fillTimestamp  = Date.now();
+        order.fees           = order.quantity * fillPrice * 0.001;
+        if (order.side === 'SELL') {
+          const users = readUsers();
+          const idx   = users.findIndex(u => u.id === order.userId);
+          if (idx !== -1) {
+            users[idx].balance = (users[idx].balance || 0) + order.quantity * fillPrice - order.fees;
+            writeUsers(users);
+          }
+        } else {
+          // BUY: adjust for actual fill vs estimated hold
+          const users = readUsers();
+          const idx   = users.findIndex(u => u.id === order.userId);
+          if (idx !== -1) {
+            const held   = order.quantity * (order.price || fillPrice) * 1.002;
+            const actual = order.quantity * fillPrice + order.fees;
+            users[idx].balance = (users[idx].balance || 0) + (held - actual);
+            writeUsers(users);
+          }
+        }
+        changed = true;
+      }
+    });
+
+    // Target / Stop-Loss monitoring on open positions
+    const usersWithPositions = [...new Set(orders.filter(o => o.status === 'FILLED').map(o => o.userId))];
+    usersWithPositions.forEach(userId => {
+      const positions = computeUserPositions(userId, priceMap);
+      positions.forEach(pos => {
+        const currentPrice = priceMap[pos.symbol];
+        if (!currentPrice) return;
+        // Find most recent filled order for this symbol with target/SL set
+        const relevantFills = orders.filter(o => o.userId === userId && o.symbol === pos.symbol && o.status === 'FILLED');
+        const latest = relevantFills[relevantFills.length - 1];
+        if (!latest) return;
+        let trigger = '';
+        if (pos.side === 'BUY') {
+          if (latest.targetPrice && currentPrice >= latest.targetPrice) trigger = 'TARGET';
+          if (latest.stopLoss   && currentPrice <= latest.stopLoss)    trigger = 'SL';
+        } else {
+          if (latest.targetPrice && currentPrice <= latest.targetPrice) trigger = 'TARGET';
+          if (latest.stopLoss   && currentPrice >= latest.stopLoss)    trigger = 'SL';
+        }
+        if (!trigger) return;
+        const alreadyPendingAuto = orders.some(
+          o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder && (o.status === 'PENDING' || o.status === 'FILLED')
+        ) || newAutoOrders.some(o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder);
+        if (alreadyPendingAuto) return;
+        const squareOffSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
+        newAutoOrders.push({
+          id            : `AUTO-${crypto.randomUUID()}`,
+          userId,
+          symbol        : pos.symbol,
+          name          : pos.name,
+          side          : squareOffSide,
+          orderType     : 'MARKET',
+          validity      : 'INTRADAY',
+          quantity      : pos.quantity,
+          price         : null,
+          stopPrice     : null,
+          targetPrice   : null,
+          stopLoss      : null,
+          status        : 'PENDING',
+          filledQuantity: 0,
+          averagePrice  : null,
+          fees          : 0,
+          timestamp     : Date.now(),
+          fillTimestamp : null,
+          expiredAt     : null,
+          isAutoOrder   : true,
+          autoReason    : trigger,
+        });
+        changed = true;
+      });
+    });
+
+    if (newAutoOrders.length) {
+      writeUserOrders([...newAutoOrders, ...orders]);
+    } else if (changed) {
+      writeUserOrders(orders);
+    }
+  } catch (err) {
+    console.error('[MatchingLoop]', err.message);
+  }
+}
+
+setInterval(runMatchingLoop, 1000);
 
 const server = app.listen(PORT, () => {
   console.log(`✅  KTrade Admin API  →  http://localhost:${PORT}/api/admin`);

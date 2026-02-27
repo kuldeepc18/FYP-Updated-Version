@@ -45,8 +45,23 @@ export const API_ENDPOINTS = {
     LOGOUT: '/auth/logout',
     ME: '/auth/me',
   },
+  USER: {
+    BALANCE_ADD: '/user/balance/add',
+    BALANCE_WITHDRAW: '/user/balance/withdraw',
+    ORDERS: '/user/orders',
+    ORDERS_PLACE: '/user/orders',
+    ORDERS_CANCEL: '/user/orders',  // append /:id
+    ORDERS_UPDATE: '/user/orders',  // append /:id  (PATCH)
+    MY_TRADES: '/user/mytrades',
+    POSITIONS: '/user/positions',
+    POSITIONS_EXIT: '/user/positions/exit',
+    POSITIONS_EXIT_ALL: '/user/positions/exit-all',
+  },
   MARKET: {
     QUOTES: '/market/quotes',
+    QUOTES_STREAM: '/market/quotes/stream',
+    ORDERBOOK: '/market/orderbook',  // append /:instrumentId
+    ORDERBOOK_STREAM: '/market/orderbook', // append /:instrumentId/stream
     SEARCH: '/market/search',
   },
   PORTFOLIO: {
@@ -54,8 +69,8 @@ export const API_ENDPOINTS = {
     POSITIONS: '/portfolio/positions',
   },
   ORDERS: {
-    CREATE: '/orders',
-    LIST: '/orders',
-    CANCEL: '/orders/:id',
+    CREATE: '/user/orders',
+    LIST: '/user/orders',
+    CANCEL: '/user/orders',  // append /:id
   },
 } as const;
