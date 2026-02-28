@@ -1077,25 +1077,41 @@ app.get('/api/admin/orders/book', requireAuth, async (_req, res) => {
 
 /**
  * GET /api/admin/trades/history
- * All orders, newest first. instrument_id & instrument_name derived per row.
+ * All order events, newest first. Uses order_status_event (real QuestDB column).
+ * TRADE_MATCH rows are excluded — only order lifecycle events are returned.
  * Query params (all optional):
- *   status        – e.g. FILLED, CANCELLED, EXPIRED, NEW, PARTIAL (single value)
+ *   status        – NEW | PARTIAL | FILLED | CANCELLED | EXPIRED  (maps to ORDER_* in QuestDB)
  *   side          – BUY | SELL
  *   instrument_id – 1..15
  *   limit         – default 1000, max 5000
  */
+
+// Maps frontend status labels → QuestDB order_status_event values
+const STATUS_TO_EVENT = {
+  NEW       : 'ORDER_NEW',
+  PARTIAL   : 'ORDER_PARTIAL',
+  FILLED    : 'ORDER_FILLED',
+  CANCELLED : 'ORDER_CANCELLED',
+  EXPIRED   : 'ORDER_EXPIRED',
+};
+// Maps QuestDB order_status_event values → frontend status labels
+const EVENT_TO_STATUS = Object.fromEntries(
+  Object.entries(STATUS_TO_EVENT).map(([k, v]) => [v, k])
+);
+
 app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
   try {
     const { status, side, instrument_id, limit } = req.query;
-    const maxLimit  = Math.min(parseInt(limit, 10) || 1000, 5000);
+    const maxLimit = Math.min(parseInt(limit, 10) || 1000, 5000);
 
-    // Build WHERE clauses
-    const clauses = [];
-    const VALID_STATUSES  = ['NEW','PARTIAL','FILLED','CANCELLED','EXPIRED'];
-    const VALID_SIDES     = ['BUY','SELL'];
+    // Always exclude internal TRADE_MATCH rows — only show order lifecycle events
+    const clauses = [`order_status_event != 'TRADE_MATCH'`];
+    const VALID_STATUSES = ['NEW', 'PARTIAL', 'FILLED', 'CANCELLED', 'EXPIRED'];
+    const VALID_SIDES    = ['BUY', 'SELL'];
 
     if (status && VALID_STATUSES.includes(status.toUpperCase())) {
-      clauses.push(`status = '${status.toUpperCase()}'`);
+      const evtVal = STATUS_TO_EVENT[status.toUpperCase()];
+      clauses.push(`order_status_event = '${evtVal}'`);
     }
     if (side && VALID_SIDES.includes(side.toUpperCase())) {
       clauses.push(`side = '${side.toUpperCase()}'`);
@@ -1103,37 +1119,93 @@ app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
     if (instrument_id) {
       const iid = parseInt(instrument_id, 10);
       if (!isNaN(iid) && INSTRUMENTS[iid]) {
-        clauses.push(`split_part(order_id, '-', 1) = '${iid}'`);
+        clauses.push(`instrument_id = '${iid}'`);
       }
     }
 
-    const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const whereClause = `WHERE ${clauses.join(' AND ')}`;
 
     const rows = await questdb(`
-      SELECT order_id, order_type, side, price, quantity, status, filled_quantity, user_id, timestamp
+      SELECT order_id, instrument_id, order_type, side, price, quantity,
+             order_status_event, filled_quantity, remaining_quantity,
+             user_id, trade_id, buyer_user_id, seller_user_id,
+             market_phase, device_id_hash, is_short_sell,
+             order_submit_timestamp, order_cancel_timestamp, timestamp
       FROM trade_logs
       ${whereClause}
       ORDER BY timestamp DESC
       LIMIT ${maxLimit}
     `);
 
+    // ── Historical enrichment for BUY-side order events ─────────────────────
+    // Orders written before the C++ trade-context fix have trade_id = 'NA'.
+    // For BUY orders we can recover the real trade_id / buyer_user_id /
+    // seller_user_id by joining against the TRADE_MATCH row that holds
+    // buy_order_id as its order_id.  SELL-side historical rows cannot be
+    // enriched this way (no sell_order_id tag in TRADE_MATCH rows).
+    const naRows = rows.filter(r => !r.trade_id || r.trade_id === 'NA');
+    if (naRows.length > 0) {
+      const buyIds = naRows.filter(r => r.side === 'BUY').map(r => `'${r.order_id}'`);
+      if (buyIds.length > 0) {
+        // QuestDB supports IN() lists; batch in chunks of 250 to stay safe
+        const matchMap = {};
+        const chunkSize = 250;
+        for (let i = 0; i < buyIds.length; i += chunkSize) {
+          const chunk = buyIds.slice(i, i + chunkSize).join(',');
+          const matchRows = await questdb(`
+            SELECT order_id, trade_id, buyer_user_id, seller_user_id
+            FROM trade_logs
+            WHERE order_status_event = 'TRADE_MATCH'
+            AND order_id IN (${chunk})
+          `).catch(() => []);
+          for (const m of matchRows) {
+            if (m.trade_id && m.trade_id !== 'NA') {
+              matchMap[m.order_id] = {
+                trade_id      : m.trade_id,
+                buyer_user_id : m.buyer_user_id,
+                seller_user_id: m.seller_user_id,
+              };
+            }
+          }
+        }
+        // Patch in-memory rows that were enrichable
+        for (const r of rows) {
+          if ((!r.trade_id || r.trade_id === 'NA') && matchMap[r.order_id]) {
+            const m = matchMap[r.order_id];
+            r.trade_id       = m.trade_id;
+            r.buyer_user_id  = m.buyer_user_id;
+            r.seller_user_id = m.seller_user_id;
+          }
+        }
+      }
+    }
+
     res.json(rows.map(r => {
-      const rawId  = (r.order_id || '').split('-')[0];
-      const instId = parseInt(rawId, 10);
-      const inst   = INSTRUMENTS[instId] || { id: rawId, name: rawId, symbol: rawId };
+      const iid    = parseInt(r.instrument_id, 10);
+      const inst   = INSTRUMENTS[iid] || { id: String(iid), name: String(iid), symbol: String(iid) };
+      const status = EVENT_TO_STATUS[r.order_status_event] ?? r.order_status_event ?? '';
       return {
-        order_id        : r.order_id,
-        instrument_id   : inst.id,
-        instrument_name : inst.name,
-        side            : r.side,
-        order_type      : r.order_type,
-        price           : r.price,
-        quantity        : r.quantity,
-        filled_quantity : r.filled_quantity,
-        total           : r.price * r.quantity,
-        status          : r.status,
-        user_id         : r.user_id,
-        timestamp       : r.timestamp,
+        order_id               : r.order_id,
+        instrument_id          : inst.id,
+        instrument_name        : inst.name,
+        side                   : r.side,
+        order_type             : r.order_type,
+        price                  : r.price,
+        quantity               : r.quantity,
+        filled_quantity        : r.filled_quantity,
+        remaining_quantity     : r.remaining_quantity,
+        total                  : r.price * r.quantity,
+        status,
+        user_id                : r.user_id,
+        trade_id               : r.trade_id       ?? 'NA',
+        buyer_user_id          : r.buyer_user_id  ?? 'NA',
+        seller_user_id         : r.seller_user_id ?? 'NA',
+        market_phase           : r.market_phase           ?? '',
+        device_id_hash         : r.device_id_hash         ?? '',
+        is_short_sell          : r.is_short_sell          ?? false,
+        order_submit_timestamp : r.order_submit_timestamp ?? 0,
+        order_cancel_timestamp : r.order_cancel_timestamp ?? 0,
+        timestamp              : r.timestamp,
       };
     }));
   } catch (err) {
@@ -1147,10 +1219,11 @@ app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
  */
 app.get('/api/admin/trades/stats', requireAuth, async (_req, res) => {
   try {
+    // Exclude TRADE_MATCH rows — count only order lifecycle events
     const [[total], [buyS], [sellS]] = await Promise.all([
-      questdb(`SELECT count(*) total_trades, sum(price * quantity) total_volume FROM trade_logs`),
-      questdb(`SELECT sum(price * quantity) buy_volume  FROM trade_logs WHERE side = 'BUY'`),
-      questdb(`SELECT sum(price * quantity) sell_volume FROM trade_logs WHERE side = 'SELL'`),
+      questdb(`SELECT count(*) total_trades, sum(price * quantity) total_volume FROM trade_logs WHERE order_status_event != 'TRADE_MATCH'`),
+      questdb(`SELECT sum(price * quantity) buy_volume  FROM trade_logs WHERE order_status_event != 'TRADE_MATCH' AND side = 'BUY'`),
+      questdb(`SELECT sum(price * quantity) sell_volume FROM trade_logs WHERE order_status_event != 'TRADE_MATCH' AND side = 'SELL'`),
     ]);
     res.json({
       total_trades : total?.total_trades  ?? 0,

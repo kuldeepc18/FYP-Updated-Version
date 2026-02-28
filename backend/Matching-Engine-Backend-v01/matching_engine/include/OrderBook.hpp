@@ -107,6 +107,7 @@ private:
 
             while (!priceLevel->isEmpty() && incomingOrder->getRemainingQuantity() > 0) {
                 auto restingOrder = priceLevel->getFirstOrder();
+                if (!restingOrder) break; // defensive: price level should not yield null while !isEmpty()
                 auto matchQty = std::min(incomingOrder->getRemainingQuantity(),
                                          restingOrder->getRemainingQuantity());
                 executeTrade(incomingOrder, restingOrder, matchQty, bestPrice);
@@ -144,27 +145,56 @@ private:
     void executeTrade(std::shared_ptr<Order> incomingOrder,
                       std::shared_ptr<Order> restingOrder,
                       size_t quantity, double price) {
-        incomingOrder->fill(quantity);
-        restingOrder->fill(quantity);
+        // ── Determine buyer / seller and aggressor side ───────────────────────
+        // The INCOMING order is always the aggressor (it crossed the spread).
+        const bool incomingIsBuy = (incomingOrder->getSide() == OrderSide::BUY);
+        const std::string& buyerUserId  = incomingIsBuy
+                                              ? incomingOrder->getTraderId()
+                                              : restingOrder->getTraderId();
+        const std::string& sellerUserId = incomingIsBuy
+                                              ? restingOrder->getTraderId()
+                                              : incomingOrder->getTraderId();
+        const std::string& buyOrderId   = incomingIsBuy
+                                              ? incomingOrder->getOrderId()
+                                              : restingOrder->getOrderId();
+        const std::string& sellOrderId  = incomingIsBuy
+                                              ? restingOrder->getOrderId()
+                                              : incomingOrder->getOrderId();
 
-        Trade trade(incomingOrder->getOrderId(), restingOrder->getOrderId(),
-                    price, quantity, std::chrono::system_clock::now());
+        // ── Build enriched Trade record FIRST — its tradeId is stamped into ──
+        //    both Order objects so that ALL subsequent logOrder() calls for the
+        //    incoming and resting orders carry real IDs (trade_id, buyer_user_id,
+        //    seller_user_id) instead of "NA", for every status event row written
+        //    to QuestDB (PARTIAL, FILLED, CANCELLED-after-partial, EXPIRED-after-partial).
+        Trade trade(buyOrderId, sellOrderId,
+                    price, quantity, std::chrono::system_clock::now(),
+                    buyerUserId, sellerUserId,
+                    incomingOrder->getSide(),          // aggressor_side
+                    incomingOrder->getInstrumentId()); // instrument_id
+
+        // ── Fill both sides, embedding Trade context into each Order ──────────
+        // Any logOrder() call on these orders (now or later, e.g. expiry/cancel)
+        // will write the real trade_id, buyer_user_id, seller_user_id.
+        incomingOrder->fillWithTradeContext(quantity, trade.getTradeId(), buyerUserId, sellerUserId);
+        restingOrder->fillWithTradeContext(quantity, trade.getTradeId(), buyerUserId, sellerUserId);
+
         recentTrades_.push_back(trade);
         if (recentTrades_.size() > 100) recentTrades_.erase(recentTrades_.begin());
 
         // Update volume counters
         totalVolume_ += quantity;
         tradeCount_  += 1;
-        if (incomingOrder->getSide() == OrderSide::BUY) buyVolume_  += quantity;
-        else                                             sellVolume_ += quantity;
+        if (incomingIsBuy) buyVolume_  += quantity;
+        else               sellVolume_ += quantity;
 
-        // Log the RESTING order's updated status (PARTIAL or FILLED) to QuestDB.
-        // The incoming order is logged by the caller (MockTrader / main.cpp) after
-        // addOrder() returns, so we only need to handle the resting order here.
         if (logger_) {
-            // Store ptr for logging after mutex is released (called from matchOrder
-            // which holds the lock, but Logger has its own mutex — still safe).
+            // Log the resting order's updated status (PARTIAL or FILLED).
+            // The incoming order is logged by the caller after addOrder() returns.
+            // Both now have trade context embedded so logOrder() produces full rows.
             logger_->logOrder(*restingOrder);
+
+            // Log the matched TRADE_MATCH row — primary row for ML graph analysis.
+            logger_->logTrade(trade);
         }
     }
 

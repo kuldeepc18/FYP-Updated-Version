@@ -13,24 +13,31 @@ cd "$(dirname "$0")"
 
 # ── 0. Kill any previously running matching engine instance ──────────────────
 PID_FILE="/tmp/matching_engine.pid"
+KILLED_OLD=0
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
     if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
         echo "=== Stopping previous matching engine (PID $OLD_PID) ==="
         kill -TERM "$OLD_PID" 2>/dev/null || true
-        # Give it up to 5 s to finish, then force-kill
-        for i in 1 2 3 4 5; do
+        # Wait up to 3 s for graceful exit, then force-kill
+        for i in 1 2 3; do
             sleep 1
             kill -0 "$OLD_PID" 2>/dev/null || break
         done
         kill -9 "$OLD_PID" 2>/dev/null || true
         echo "  Previous instance stopped."
+        KILLED_OLD=1
     fi
     rm -f "$PID_FILE"
 fi
-# Also kill any stale matching_engine processes not tracked by PID file
-pkill -9 -f "\./matching_engine" 2>/dev/null || true
-sleep 1
+# Kill any stale processes not tracked by PID file (only pay the 1-s penalty
+# if we actually found and killed something above, otherwise skip the wait)
+if pkill -9 -f "\./matching_engine" 2>/dev/null; then
+    KILLED_OLD=1
+fi
+if [ "$KILLED_OLD" -eq 1 ]; then
+    sleep 1   # Brief settle so OS releases the port before the new instance binds
+fi
 echo ""
 
 # --- 1. Check QuestDB is reachable (HTTP REST on port 9000) ------------------
@@ -57,10 +64,29 @@ fi
 echo "  QuestDB is reachable [OK]"
 echo ""
 
-# --- 2. Build ----------------------------------------------------------------
-echo "=== Building matching engine ==="
-g++ -std=c++17 -I../include -pthread -O2 -o matching_engine main.cpp
-echo "=== Build successful ==="
+# --- 2. Build (only when source or headers are newer than the binary) --------
+NEEDS_BUILD=0
+if [ ! -f matching_engine ]; then
+    NEEDS_BUILD=1
+    echo "=== Building matching engine (first build) ==="
+elif [ main.cpp -nt matching_engine ] || \
+     [ ../include/Order.hpp -nt matching_engine ] || \
+     [ ../include/OrderBook.hpp -nt matching_engine ] || \
+     [ ../include/Logger.hpp -nt matching_engine ] || \
+     [ ../include/Instrument.hpp -nt matching_engine ] || \
+     [ ../include/MarketDisplay.hpp -nt matching_engine ] || \
+     [ ../include/PriceLevel.hpp -nt matching_engine ] || \
+     [ ../include/Trade.hpp -nt matching_engine ]; then
+    NEEDS_BUILD=1
+    echo "=== Source changed — rebuilding matching engine ==="
+fi
+
+if [ "$NEEDS_BUILD" -eq 1 ]; then
+    g++ -std=c++17 -I../include -pthread -O2 -o matching_engine main.cpp
+    echo "=== Build successful ==="
+else
+    echo "=== Binary is up to date — skipping recompile ==="
+fi
 echo ""
 
 # --- 3. Run ------------------------------------------------------------------

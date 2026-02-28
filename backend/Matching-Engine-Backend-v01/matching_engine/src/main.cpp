@@ -55,10 +55,10 @@ static char _getch() {
 #endif
 // ─────────────────────────────────────────────────────────────────────────────
 #include "OrderBook.hpp"
-#include "MockTrader.hpp"
 #include "Logger.hpp"
 #include "MarketDisplay.hpp"
 #include "Instrument.hpp"
+#include "MockTrader.hpp"
 
 // ─── Global shutdown flag set by signal handlers ──────────────────────────────
 // When SIGTERM / SIGINT / SIGHUP arrives the handler flips this to true.
@@ -239,34 +239,27 @@ public:
             orderBooks_[instrument.instrumentId] = std::make_shared<OrderBook>(&logger_);
             marketDisplays_[instrument.instrumentId] = std::make_shared<MarketDisplay>(orderBooks_[instrument.instrumentId]);
         }
-        // No static price range is set; all prices are determined by order flow and mock traders
+        // No static price range is set; all prices are determined by real order flow.
         currentInstrumentId_ = 1; // Default to first instrument
     }
 
     void start() {
-        // Start mock traders for each instrument
-        std::cout << "Starting mock traders..." << std::endl;
-        int instrumentsCount = static_cast<int>(orderBooks_.size());
-        int maxMockTraders = 10000;
-        int tradersPerInstrument = maxMockTraders / instrumentsCount;
-        for (const auto& [instrumentId, orderBook] : orderBooks_) {
-            for (int i = 0; i < tradersPerInstrument; ++i) {
-                auto trader = std::make_shared<MockTrader>(
-                    orderBook,
-                    instrumentId,
-                    &logger_ // Pass logger to log mock trader orders
-                );
-                mockTraders_.push_back(trader);
-                trader->start();
-            }
-        }
-
         // Start market data display thread
         displayThread_ = std::thread(&TradingApplication::displayMarketData, this);
 
         // Start the lightweight order-book HTTP server (port 9100)
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
+
+        // ── Start mock traders (20 per instrument) to generate live order flow ──
+        for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
+            auto ob = orderBooks_[instrument.instrumentId];
+            for (int i = 0; i < 20; ++i) {
+                mockTraders_.emplace_back(
+                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
+                mockTraders_.back()->start();
+            }
+        }
 
         // Main trading loop
         running_ = true;
@@ -319,10 +312,10 @@ public:
         }
         running_ = false;
 
-        // Cleanup
-        for (auto& trader : mockTraders_) {
+        // Stop all mock traders
+        for (auto& trader : mockTraders_)
             trader->stop();
-        }
+        mockTraders_.clear();
 
         // Stop book HTTP server
         bookServerRunning_ = false;
@@ -1407,7 +1400,6 @@ private:
     std::map<int, std::shared_ptr<OrderBook>> orderBooks_;
     std::map<int, std::shared_ptr<MarketDisplay>> marketDisplays_;
     Logger logger_;
-    std::vector<std::shared_ptr<MockTrader>> mockTraders_;
     std::vector<std::shared_ptr<Order>> userOrders_;
     std::atomic<bool> running_{false};
     std::thread displayThread_;
@@ -1427,6 +1419,9 @@ private:
     // ── Book HTTP server (port 9100) ──────────────────────────────────────────
     std::thread         bookServerThread_;
     std::atomic<bool>   bookServerRunning_{false};
+
+    // ── Mock traders ──────────────────────────────────────────────────────────
+    std::vector<std::unique_ptr<MockTrader>> mockTraders_;
 
     // Build a JSON string for the top-5 bid/ask levels of one instrument.
     // Reads directly from the in-memory OrderBook — same source as the terminal display.

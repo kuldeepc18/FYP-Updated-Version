@@ -20,6 +20,19 @@ function fmtTimestamp(iso: string): string {
   return `${hh}:${mm}:${ss}, ${days[d.getDay()]}, ${dd}-${mo}-${yyyy}`;
 }
 
+// Format a microsecond-epoch timestamp (QuestDB LONG columns)
+function fmtMicros(us: number): string {
+  if (!us || us === 0) return "—";
+  const d  = new Date(us / 1000); // µs → ms
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const yy = d.getFullYear();
+  return `${hh}:${mm}:${ss} ${dd}-${mo}-${yy}`;
+}
+
 function fmtNum(n: number, d = 2) {
   return new Intl.NumberFormat("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
 }
@@ -227,11 +240,20 @@ export default function TradeHistory() {
                   <th className="text-right">Price</th>
                   <th className="text-right">Qty</th>
                   <th className="text-right">Filled</th>
+                  <th className="text-right">Remaining</th>
                   <th className="text-right">Net Amount</th>
                   <th>User ID</th>
                   <th>Order ID</th>
+                  <th>Trade ID</th>
+                  <th>Buyer User ID</th>
+                  <th>Seller User ID</th>
+                  <th>Market Phase</th>
+                  <th>Device ID Hash</th>
+                  <th>Short Sell</th>
                   <th>Status</th>
-                  <th className="text-right">Time</th>
+                  <th>Submit Time</th>
+                  <th>Cancel Time</th>
+                  <th className="text-right">Event Time</th>
                 </tr>
               </thead>
               <tbody>
@@ -249,14 +271,45 @@ export default function TradeHistory() {
                     <td className="text-right font-mono">{fmtNum(t.price)}</td>
                     <td className="text-right font-mono">{fmtNum(t.quantity, 0)}</td>
                     <td className="text-right font-mono text-muted-foreground">{fmtNum(t.filled_quantity, 0)}</td>
+                    <td className="text-right font-mono text-muted-foreground">{fmtNum(t.remaining_quantity, 0)}</td>
                     <td className="text-right font-mono">{fmtNum(t.total)}</td>
                     <td className="font-mono text-xs text-muted-foreground">{t.user_id}</td>
                     <td className="font-mono text-xs text-muted-foreground">{t.order_id}</td>
+                    <td className="font-mono text-xs text-muted-foreground">
+                      {t.trade_id === "NA" ? <span className="opacity-30">NA</span> : t.trade_id}
+                    </td>
+                    <td className="font-mono text-xs text-muted-foreground">
+                      {t.buyer_user_id === "NA" ? <span className="opacity-30">NA</span> : t.buyer_user_id}
+                    </td>
+                    <td className="font-mono text-xs text-muted-foreground">
+                      {t.seller_user_id === "NA" ? <span className="opacity-30">NA</span> : t.seller_user_id}
+                    </td>
+                    <td>
+                      <span className={cn("text-xs px-1.5 py-0.5 rounded font-medium",
+                        t.market_phase === "OPEN"     ? "bg-positive/15 text-positive" :
+                        t.market_phase === "PRE_OPEN" ? "bg-warning/15 text-warning"   :
+                        "bg-muted text-muted-foreground")}>
+                        {t.market_phase || "—"}
+                      </span>
+                    </td>
+                    <td className="font-mono text-xs text-muted-foreground">{t.device_id_hash || "—"}</td>
+                    <td className="text-center">
+                      <span className={cn("text-xs font-medium",
+                        t.is_short_sell ? "text-destructive" : "text-muted-foreground")}>
+                        {t.is_short_sell ? "Yes" : "No"}
+                      </span>
+                    </td>
                     <td>
                       <span className={cn("text-xs px-2 py-0.5 rounded",
                         STATUS_COLOR[t.status] ?? "bg-secondary text-muted-foreground")}>
                         {t.status}
                       </span>
+                    </td>
+                    <td className="font-mono text-xs text-muted-foreground whitespace-nowrap">
+                      {fmtMicros(t.order_submit_timestamp)}
+                    </td>
+                    <td className="font-mono text-xs text-muted-foreground whitespace-nowrap">
+                      {fmtMicros(t.order_cancel_timestamp)}
                     </td>
                     <td className="text-right font-mono text-xs text-muted-foreground whitespace-nowrap">
                       {fmtTimestamp(t.timestamp)}

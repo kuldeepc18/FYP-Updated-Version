@@ -47,18 +47,27 @@ export interface OrderBookEntry {
 }
 
 export interface TradeRecord {
-  order_id        : string;
-  instrument_id   : string;
-  instrument_name : string;
-  side            : 'BUY' | 'SELL';
-  order_type      : string;
-  price           : number;
-  quantity        : number;
-  filled_quantity : number;
-  total           : number;
-  status          : string;
-  user_id         : string;
-  timestamp       : string;
+  order_id               : string;
+  instrument_id          : string;
+  instrument_name        : string;
+  side                   : 'BUY' | 'SELL';
+  order_type             : string;
+  price                  : number;
+  quantity               : number;
+  filled_quantity        : number;
+  remaining_quantity     : number;
+  total                  : number;
+  status                 : string;
+  user_id                : string;
+  trade_id               : string;
+  buyer_user_id          : string;
+  seller_user_id         : string;
+  market_phase           : string;
+  device_id_hash         : string;
+  is_short_sell          : boolean;
+  order_submit_timestamp : number;   // microseconds since Unix epoch
+  order_cancel_timestamp : number;   // microseconds since Unix epoch (0 = not cancelled)
+  timestamp              : string;
 }
 
 export interface TradeStats {
@@ -147,18 +156,27 @@ export async function getTradeHistory(params: TradeHistoryParams = {}): Promise<
   try {
     const { data } = await adminApiClient.get(ADMIN_API_ENDPOINTS.TRADES.HISTORY, { params });
     return (data as any[]).map((r) => ({
-      order_id        : r.order_id        ?? r.id ?? '',
-      instrument_id   : r.instrument_id   ?? '',
-      instrument_name : r.instrument_name ?? '',
-      side            : r.side as 'BUY' | 'SELL',
-      order_type      : r.order_type      ?? r.orderType ?? '',
-      price           : r.price           ?? 0,
-      quantity        : r.quantity        ?? 0,
-      filled_quantity : r.filled_quantity ?? r.filledQuantity ?? 0,
-      total           : r.total           ?? 0,
-      status          : r.status          ?? '',
-      user_id         : r.user_id         ?? r.userId ?? '',
-      timestamp       : r.timestamp       ?? '',
+      order_id               : r.order_id               ?? r.id ?? '',
+      instrument_id          : r.instrument_id          ?? '',
+      instrument_name        : r.instrument_name        ?? '',
+      side                   : r.side as 'BUY' | 'SELL',
+      order_type             : r.order_type             ?? r.orderType ?? '',
+      price                  : r.price                  ?? 0,
+      quantity               : r.quantity               ?? 0,
+      filled_quantity        : r.filled_quantity        ?? r.filledQuantity ?? 0,
+      remaining_quantity     : r.remaining_quantity     ?? 0,
+      total                  : r.total                  ?? 0,
+      status                 : r.status                 ?? '',
+      user_id                : r.user_id                ?? r.userId ?? '',
+      trade_id               : r.trade_id               ?? 'NA',
+      buyer_user_id          : r.buyer_user_id          ?? 'NA',
+      seller_user_id         : r.seller_user_id         ?? 'NA',
+      market_phase           : r.market_phase           ?? '',
+      device_id_hash         : r.device_id_hash         ?? '',
+      is_short_sell          : r.is_short_sell          ?? false,
+      order_submit_timestamp : r.order_submit_timestamp ?? 0,
+      order_cancel_timestamp : r.order_cancel_timestamp ?? 0,
+      timestamp              : r.timestamp              ?? '',
     }));
   } catch (err) {
     console.error('getTradeHistory failed:', err);

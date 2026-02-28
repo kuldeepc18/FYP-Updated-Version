@@ -799,13 +799,13 @@
     "stopPrice": null,
     "targetPrice": null,
     "stopLoss": null,
-    "status": "PENDING",
+    "status": "EXPIRED",
     "filledQuantity": 0,
     "averagePrice": null,
     "fees": 0,
     "timestamp": 1772224835325,
     "fillTimestamp": null,
-    "expiredAt": null,
+    "expiredAt": 1772273011018,
     "isAutoOrder": false
   },
   {
