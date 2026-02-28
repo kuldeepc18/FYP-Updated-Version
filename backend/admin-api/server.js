@@ -114,42 +114,106 @@ const INSTRUMENTS = {
   15: { id: '15', name: 'Nifty Next 50 Index',        symbol: 'NIFTY NEXT 50',     basePrice: 70413.4   },
 };
 
-// ─── QuestDB ILP writer — persists a single user order event ────────────────
+// ─── Market Phase Helper ─────────────────────────────────────────────────────
+// Returns current Indian market phase based on IST time.
+function getMarketPhase() {
+  const nowIST  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const minOfDay = nowIST.getHours() * 60 + nowIST.getMinutes();
+  if (minOfDay >= 9 * 60 && minOfDay < 9 * 60 + 15)   return 'PRE_OPEN';
+  if (minOfDay >= 9 * 60 + 15 && minOfDay < 15 * 60 + 30) return 'OPEN';
+  if (minOfDay >= 15 * 60 + 30 && minOfDay < 16 * 60)  return 'AFTER_MARKET';
+  return 'CLOSED';
+}
+
+// ─── Device Hash Helper ──────────────────────────────────────────────────────
+// Produces a stable, per-user device_id_hash. Same user → same hash always.
+// Different users → different hashes. Uses HMAC-SHA256 keyed on a fixed secret.
+function getUserDeviceHash(userId) {
+  return crypto.createHmac('sha256', 'ktrade_device_secret_2026')
+    .update(String(userId))
+    .digest('hex')
+    .slice(0, 32);
+}
+
+// ─── QuestDB ILP writer — persists a single user order event ─────────────────
+//
 // Uses QuestDB's InfluxDB Line Protocol HTTP endpoint (port 9000 /write).
-// Tag columns (SYMBOL): order_id, instrument_id, order_type, side, status, user_id
-// Field columns       : price (DOUBLE), quantity (LONG), filled_quantity (LONG)
-// order_id format mirrors the C++ engine: {instrument_id}-{timestamp_ms}-{userId}
-async function writeUserTradeToQuestDB(order, fillPrice, filledQty, status) {
+//
+// Tag columns  (SYMBOL, indexed): order_id, instrument_id, order_type, side,
+//   order_status_event, user_id, trade_id, buyer_user_id, seller_user_id,
+//   aggressor_side, market_phase, device_id_hash
+// Field columns: price (DOUBLE), quantity (LONG), filled_quantity (LONG),
+//   remaining_quantity (LONG), is_short_sell (BOOLEAN),
+//   order_submit_timestamp (LONG), order_cancel_timestamp (LONG)
+//
+// statusEvent: 'ORDER_NEW' | 'ORDER_PARTIAL' | 'ORDER_FILLED' |
+//              'ORDER_CANCELLED' | 'ORDER_EXPIRED'
+//
+// order_id format: {instrument_id}-{sanitised-uuid}
+//   → split_part(order_id,'-',1) yields instrument_id (compatible with all
+//     existing QuestDB queries, which expect this layout from the C++ engine).
+//
+async function writeUserTradeToQuestDB(order, fillPrice, filledQty, statusEvent, opts = {}) {
   try {
     const instEntry    = Object.values(INSTRUMENTS).find(i => i.symbol === order.symbol);
     const instrumentId = instEntry ? instEntry.id : '0';
     const nowMs        = Date.now();
-    // Unique order_id: instrument_id-timestamp_ms-userId  (no hyphens inside any part)
-    const questOrderId = `${instrumentId}-${nowMs}-${order.userId}`;
-    const tsNs         = BigInt(nowMs) * 1_000_000n; // ms → ns for ILP timestamp
+    const tsNs         = BigInt(nowMs) * 1_000_000n; // ms → nanoseconds for ILP
+
+    // order_id: embed instrument_id so split_part(order_id,'-',1) works.
+    // Sanitise the UUID (remove hyphens) to avoid ambiguity in split_part.
+    const sanitisedUuid = String(order.id || nowMs).replace(/-/g, '');
+    const questOrderId  = `${instrumentId}-${sanitisedUuid}`;
+
+    const deviceIdHash  = getUserDeviceHash(order.userId);
+    const marketPhase   = getMarketPhase();
+
+    // Fill / trade context (only meaningful for FILLED / PARTIAL)
+    const tradeId       = opts.tradeId       || 'NA';
+    const buyerUserId   = opts.buyerUserId   || (order.side === 'BUY'  ? String(order.userId) : 'NA');
+    const sellerUserId  = opts.sellerUserId  || (order.side === 'SELL' ? String(order.userId) : 'NA');
+    const aggressorSide = opts.aggressorSide || (filledQty > 0 ? order.side : 'NA');
+
+    const remainingQty  = Math.max(0, (order.quantity || 0) - filledQty);
+    const submitTs      = order.timestamp    || nowMs;
+    const cancelTs      = opts.cancelTimestamp || 0;
+
+    // is_short_sell: TRUE for SELL orders that are not closing an existing long.
+    // The backend tracks this via the isPositionExit flag set on auto-exit orders.
+    const isShortSell   = order.side === 'SELL' && !(order.isAutoOrder && order.autoReason === 'USER_EXIT');
 
     // ILP tag values must escape spaces (→ '\ '), commas (→ '\,'), '=' (→ '\=')
     const esc = s => String(s).replace(/,/g, '\\,').replace(/=/g, '\\=').replace(/ /g, '\\ ');
 
-    // Build line: <table>,<tags> <fields> <timestamp_ns>
+    // Build ILP line:  table,tags fields timestamp_ns
     const line =
       `trade_logs` +
       `,order_id=${esc(questOrderId)}` +
       `,instrument_id=${esc(instrumentId)}` +
       `,order_type=${esc(order.orderType || 'MARKET')}` +
       `,side=${esc(order.side)}` +
-      `,status=${esc(status)}` +
+      `,order_status_event=${esc(statusEvent)}` +
       `,user_id=${esc(order.userId)}` +
+      `,trade_id=${esc(tradeId)}` +
+      `,buyer_user_id=${esc(buyerUserId)}` +
+      `,seller_user_id=${esc(sellerUserId)}` +
+      `,aggressor_side=${esc(aggressorSide)}` +
+      `,market_phase=${esc(marketPhase)}` +
+      `,device_id_hash=${esc(deviceIdHash)}` +
       ` price=${Number(fillPrice)}` +
-      `,quantity=${order.quantity}i` +
+      `,quantity=${order.quantity || 0}i` +
       `,filled_quantity=${filledQty}i` +
+      `,remaining_quantity=${remainingQty}i` +
+      `,is_short_sell=${isShortSell}` +
+      `,order_submit_timestamp=${submitTs}i` +
+      `,order_cancel_timestamp=${cancelTs}i` +
       ` ${tsNs}\n`;
 
     await axios.post(QUESTDB_ILP, line, {
       headers : { 'Content-Type': 'text/plain' },
       timeout : 5000,
     });
-    console.log(`[QuestDB ILP] user_id=${order.userId} ${order.side} ${order.quantity}x${order.symbol} @ ${fillPrice} → ${status}`);
+    console.log(`[QuestDB ILP] ${statusEvent} user=${order.userId} ${order.side} ${order.quantity}x${order.symbol} @ ${fillPrice}`);
   } catch (err) {
     console.error('[QuestDB ILP] write failed:', err.response?.data || err.message);
   }
@@ -252,6 +316,7 @@ app.post('/api/auth/register', async (req, res) => {
       balance: 100000,
       total_trades_placed: 0,
       created_at: new Date().toISOString(),
+      device_id_hash: getUserDeviceHash(String(numericId)),
     };
     allUsers.push(newUser);
     writeUsers(allUsers);
@@ -337,6 +402,17 @@ app.get('/api/auth/me', requireUserAuth, (req, res) => {
 
 // Shared helper: fetch latest 24h instrument stats from QuestDB
 async function fetchMarketQuotes() {
+  // ── CRITICAL: only use actual TRADE_MATCH (matching-engine executions) and
+  // ORDER_FILLED (user paper-trade fills) events to derive the LTP.
+  //
+  // Why: ORDER_NEW events are written to trade_logs when a LIMIT order is placed,
+  // using the order's limit price (e.g. ₹1 800 for a sell-limit on a ₹500 stock).
+  // Including those rows in last(price) would momentarily set the LTP to ₹1 800,
+  // causing the matching-loop to fill other pending orders at that phantom price.
+  // ORDER_CANCELLED / ORDER_EXPIRED rows have the same problem.
+  //
+  // Only TRADE_MATCH (C++ matching engine) and ORDER_FILLED (paper-trade backend)
+  // rows carry the real execution price that should drive the live market price.
   const stats = await questdb(`
     SELECT
       split_part(order_id, '-', 1) AS instrument_id,
@@ -347,28 +423,64 @@ async function fetchMarketQuotes() {
       sum(quantity)                AS total_volume_qty
     FROM trade_logs
     WHERE timestamp > dateadd('h', -24, now())
+      AND order_status_event IN ('TRADE_MATCH', 'ORDER_FILLED')
     GROUP BY instrument_id
   `);
 
   const priceMap = {};
   stats.forEach(row => { priceMap[row.instrument_id] = row; });
 
+  // ── Circuit-breaker tracking ──────────────────────────────────────────────
+  // NSE standard: individual stocks have 20 % daily circuit limits.
+  // We use inst.basePrice (last known reference / previous-close equivalent)
+  // as the anchor.  If the live LTP has moved ≥ 20 % above that anchor the
+  // instrument is flagged UPPER_CIRCUIT; ≥ 20 % below → LOWER_CIRCUIT.
+  // Thresholds that match NSE filter bands: 2 %, 5 %, 10 %, 20 %.
+  // Here we expose the breach level (2 / 5 / 10 / 20) so the UI can show
+  // the tightest applicable circuit that has been hit.
+  const CIRCUIT_BANDS = [20, 10, 5, 2]; // highest first so we break on tightest hit
+
   return Object.values(INSTRUMENTS).map(inst => {
-    const row       = priceMap[inst.id];
-    const lastPrice  = row?.last_price   ?? inst.basePrice;
+    const row        = priceMap[inst.id];
+    const lastPrice  = row?.last_price    ?? inst.basePrice;
     const startPrice = row?.price_at_start ?? inst.basePrice;
     const change     = lastPrice - startPrice;
     const changePct  = startPrice ? (change / startPrice) * 100 : 0;
+
+    // Determine circuit status relative to the instrument's reference base price
+    const pctFromBase  = inst.basePrice > 0
+      ? ((lastPrice - inst.basePrice) / inst.basePrice) * 100
+      : 0;
+    let circuitStatus  = 'NONE';   // 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE'
+    let circuitBand    = 0;        // 2 | 5 | 10 | 20 — the breached band (0 = none)
+
+    for (const band of CIRCUIT_BANDS) {
+      if (pctFromBase >= band) {
+        circuitStatus = 'UPPER_CIRCUIT';
+        circuitBand   = band;
+        break;
+      }
+      if (pctFromBase <= -band) {
+        circuitStatus = 'LOWER_CIRCUIT';
+        circuitBand   = band;
+        break;
+      }
+    }
+
     return {
-      id           : inst.id,
-      symbol       : inst.symbol,
-      name         : inst.name,
-      marketPrice  : lastPrice,
-      change       : change,
-      changePercent: changePct,
-      high24h      : row?.high24h ?? lastPrice,
-      low24h       : row?.low24h  ?? lastPrice,
-      volume       : row?.total_volume_qty ?? 0,
+      id            : inst.id,
+      symbol        : inst.symbol,
+      name          : inst.name,
+      marketPrice   : lastPrice,
+      change        : change,
+      changePercent : changePct,
+      high24h       : row?.high24h ?? lastPrice,
+      low24h        : row?.low24h  ?? lastPrice,
+      volume        : row?.total_volume_qty ?? 0,
+      // Circuit breaker fields (used by matching-loop + frontend)
+      circuitStatus : circuitStatus,  // 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE'
+      circuitBand   : circuitBand,    // 2 / 5 / 10 / 20 — 0 means no circuit
+      basePrice     : inst.basePrice, // reference price used for circuit calc
     };
   });
 }
@@ -528,28 +640,35 @@ app.post('/api/user/orders', requireUserAuth, async (req, res) => {
   if (!['MARKET','LIMIT','STOP','STOP_LIMIT'].includes(orderType)) return res.status(400).json({ error: 'Invalid orderType' });
   if (!['INTRADAY','OVERNIGHT'].includes(validity || 'INTRADAY')) return res.status(400).json({ error: 'validity must be INTRADAY or OVERNIGHT' });
   if (parseInt(quantity, 10) <= 0) return res.status(400).json({ error: 'quantity must be positive' });
-  const user = findUserById(userId);
+
+  const user     = findUserById(userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === symbol);
-  // For BUY orders: validate + hold balance immediately
+
+  // ── Single live-price fetch shared by (a) BUY balance-hold, (b) placedAtPrice,
+  //    and (c) the circuit-breaker check later in this handler.
+  let allQuotes    = [];
+  let placedAtPrice = null;   // LIVE LTP at the moment of order placement
+  try {
+    allQuotes     = await fetchMarketQuotes();
+    const symQ    = allQuotes.find(q => q.symbol === symbol);
+    placedAtPrice = symQ ? symQ.marketPrice : (instEntry ? instEntry.basePrice : null);
+  } catch { /* non-critical */ }
+
+  // ── For BUY orders: validate balance and hold funds ──────────────────────
   if (side === 'BUY') {
-    let estPrice = price ? parseFloat(price) : null;
-    if (!estPrice) {
-      try {
-        const quotes = await fetchMarketQuotes();
-        const q = quotes.find(q => q.symbol === symbol);
-        estPrice = q ? q.marketPrice : (instEntry ? instEntry.basePrice : null);
-      } catch {}
-    }
-    if (!estPrice) return res.status(400).json({ error: 'Cannot determine price for symbol' });
-    const requiredFunds = parseInt(quantity, 10) * estPrice * 1.002;
+    // Hold based on the LIMIT price if specified (worst-case cost), otherwise LTP.
+    const holdPrice = price ? parseFloat(price) : (placedAtPrice ?? (instEntry ? instEntry.basePrice : null));
+    if (!holdPrice) return res.status(400).json({ error: 'Cannot determine price for symbol' });
+    const requiredFunds = parseInt(quantity, 10) * holdPrice * 1.002;
     if ((user.balance || 0) < requiredFunds) {
-      return res.status(400).json({ error: `Insufficient balance. Required: \u20b9${requiredFunds.toFixed(2)}, Available: \u20b9${(user.balance || 0).toFixed(2)}` });
+      return res.status(400).json({ error: `Insufficient balance. Required: ₹${requiredFunds.toFixed(2)}, Available: ₹${(user.balance || 0).toFixed(2)}` });
     }
     const users = readUsers();
     const idx   = users.findIndex(u => u.id === userId);
     if (idx !== -1) { users[idx].balance -= requiredFunds; writeUsers(users); }
   }
+
   const order = {
     id            : crypto.randomUUID(),
     userId,
@@ -571,11 +690,61 @@ app.post('/api/user/orders', requireUserAuth, async (req, res) => {
     fillTimestamp : null,
     expiredAt     : null,
     isAutoOrder   : false,
+    // LTP captured at the moment this order was placed — used by the matching
+    // loop to determine fill direction (must market rise or fall to reach limit?).
+    placedAtPrice : placedAtPrice,
   };
   const orders = readUserOrders();
   orders.unshift(order);
   writeUserOrders(orders);
-  res.status(201).json({ ...order, type: order.orderType });
+
+  // Persist ORDER_NEW event to QuestDB trade_logs immediately so the order
+  // is visible under the user's history even before it is filled/expired.
+  // The limit price is intentionally recorded here for full audit visibility —
+  // the LTP contamination that previously caused phantom fills is prevented by
+  // the SQL filter in fetchMarketQuotes() which only reads TRADE_MATCH and
+  // ORDER_FILLED events for price data.  ORDER_NEW rows are excluded from LTP.
+  const auditPrice = price ? parseFloat(price) : (instEntry ? instEntry.basePrice : 0);
+  writeUserTradeToQuestDB(order, auditPrice, 0, 'ORDER_NEW').catch(() => {});
+
+  // ── Circuit-breaker check for LIMIT / STOP_LIMIT orders ─────────────────────
+  // Reuse allQuotes (already fetched above) — no second network call needed.
+  let circuitStatus  = 'NONE';   // 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE'
+  let circuitBand    = 0;        // 2 | 5 | 10 | 20
+  let circuitWarning = null;     // human-readable warning string or null
+
+  if (orderType === 'LIMIT' || orderType === 'STOP_LIMIT') {
+    const limitPrice = parseFloat(price) || 0;
+    const ltp        = placedAtPrice || 0;   // already fetched above
+
+    if (limitPrice > 0 && ltp > 0) {
+      const pctDiff = ((limitPrice - ltp) / ltp) * 100;
+      const BANDS   = [20, 10, 5, 2];
+
+      for (const band of BANDS) {
+        if (pctDiff >= band) {
+          circuitStatus  = 'UPPER_CIRCUIT';
+          circuitBand    = band;
+          circuitWarning = `⚠️ Order price ₹${limitPrice.toFixed(2)} is ${pctDiff.toFixed(1)}% above the current LTP ₹${ltp.toFixed(2)} — this instrument may hit the UPPER CIRCUIT (${band}% band). Your order will remain PENDING until the market gradually reaches ₹${limitPrice.toFixed(2)} or it expires (INTRADAY) / stays overnight (OVERNIGHT).`;
+          break;
+        }
+        if (pctDiff <= -band) {
+          circuitStatus  = 'LOWER_CIRCUIT';
+          circuitBand    = band;
+          circuitWarning = `⚠️ Order price ₹${limitPrice.toFixed(2)} is ${Math.abs(pctDiff).toFixed(1)}% below the current LTP ₹${ltp.toFixed(2)} — this instrument may hit the LOWER CIRCUIT (${band}% band). Your order will remain PENDING until the market gradually reaches ₹${limitPrice.toFixed(2)} or it expires (INTRADAY) / stays overnight (OVERNIGHT).`;
+          break;
+        }
+      }
+    }
+  }
+
+  res.status(201).json({
+    ...order,
+    type          : order.orderType,
+    circuitStatus,
+    circuitBand,
+    circuitWarning,
+  });
 });
 
 // DELETE /api/user/orders/:id — cancel a pending order
@@ -600,6 +769,16 @@ app.delete('/api/user/orders/:id', requireUserAuth, (req, res) => {
   orders[idx].status      = 'CANCELLED';
   orders[idx].cancelledAt = Date.now();
   writeUserOrders(orders);
+
+  // Persist ORDER_CANCELLED event to QuestDB trade_logs
+  writeUserTradeToQuestDB(
+    orders[idx],
+    orders[idx].price || orders[idx].averagePrice || 0,
+    orders[idx].filledQuantity || 0,
+    'ORDER_CANCELLED',
+    { cancelTimestamp: orders[idx].cancelledAt }
+  ).catch(() => {});
+
   res.json({ ok: true, id: orderId });
 });
 
@@ -1293,22 +1472,80 @@ async function runMatchingLoop() {
           const idx   = users.findIndex(u => u.id === order.userId);
           if (idx !== -1) { users[idx].balance = (users[idx].balance || 0) + order.quantity * (order.price || currentPrice) * 1.002; writeUsers(users); }
         }
-        questdbWrites.push({ order: { ...order }, fillPrice: order.price || currentPrice, filledQty: 0, status: 'EXPIRED' });
+        questdbWrites.push({ order: { ...order }, fillPrice: order.price || currentPrice, filledQty: 0, statusEvent: 'ORDER_EXPIRED', opts: { cancelTimestamp: order.expiredAt } });
         changed = true;
         return;
       }
 
-      // Fill conditions
+      // ── Fill conditions ────────────────────────────────────────────────────
+      //
+      // MARKET orders fill immediately at current LTP.
+      //
+      // LIMIT orders — directional semantics based on placedAtPrice:
+      //
+      //   When a limit order is placed, we snapshot the live LTP as
+      //   `order.placedAtPrice`.  The market must TRAVEL from that snapshot
+      //   to the user's limit price before the order can fill.
+      //
+      //   BUY LIMIT at X:  (user wants to buy when the market reaches X)
+      //     • placed when LTP < X  →  wait for price to RISE  to X  → fill when currentPrice >= X
+      //     • placed when LTP > X  →  wait for price to DROP  to X  → fill when currentPrice <= X
+      //     • placed when LTP == X →  fill immediately (already at price)
+      //
+      //   SELL LIMIT at X:  (user wants to sell when the market reaches X)
+      //     • placed when LTP > X  →  wait for price to DROP  to X  → fill when currentPrice <= X
+      //     • placed when LTP < X  →  wait for price to RISE  to X  → fill when currentPrice >= X
+      //     • placed when LTP == X →  fill immediately (already at price)
+      //
+      //   This guarantees that regardless of how far the limit price is from
+      //   the LTP at placement time, the order stays PENDING until the live
+      //   market price genuinely moves to (or through) the user's stated price.
+      //
+      // STOP / STOP_LIMIT orders use conventional trigger semantics:
+      //   BUY  STOP: fires when price rises  to stopPrice (breakout buy)
+      //   SELL STOP: fires when price falls  to stopPrice (stop-loss sell)
+      //
+      // NOTE: `currentPrice` comes exclusively from TRADE_MATCH and
+      // ORDER_FILLED events in QuestDB — ORDER_NEW rows are excluded from the
+      // LTP query so a freshly placed limit order never inflates the LTP and
+      // causes a phantom self-fill.
       let shouldFill = false;
       let fillPrice  = currentPrice;
+
       if (order.orderType === 'MARKET') {
         shouldFill = true;
+        fillPrice  = currentPrice;
+
       } else if (order.orderType === 'LIMIT') {
-        if (order.side === 'BUY'  && currentPrice <= order.price) { shouldFill = true; fillPrice = order.price; }
-        if (order.side === 'SELL' && currentPrice >= order.price) { shouldFill = true; fillPrice = order.price; }
+        const limitPx     = order.price;
+        const placedAt    = order.placedAtPrice;  // LTP when order was created
+
+        if (order.side === 'BUY') {
+          // Determine which direction the market must travel to reach the limit.
+          // If no placedAtPrice (legacy order), treat conservatively: require price
+          // to reach the limit from below (i.e. price must rise to limitPx).
+          if (placedAt == null || placedAt <= limitPx) {
+            // Market was AT or BELOW limit when placed  →  wait for price to RISE
+            if (currentPrice >= limitPx) { shouldFill = true; fillPrice = limitPx; }
+          } else {
+            // Market was ABOVE limit when placed  →  wait for price to DROP
+            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = currentPrice; }
+          }
+        } else { // SELL
+          if (placedAt == null || placedAt >= limitPx) {
+            // Market was AT or ABOVE limit when placed  →  wait for price to DROP
+            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = limitPx; }
+          } else {
+            // Market was BELOW limit when placed  →  wait for price to RISE
+            if (currentPrice >= limitPx) { shouldFill = true; fillPrice = limitPx; }
+          }
+        }
+
       } else if (order.orderType === 'STOP' || order.orderType === 'STOP_LIMIT') {
-        if (order.side === 'BUY'  && currentPrice >= order.stopPrice) { shouldFill = true; }
-        if (order.side === 'SELL' && currentPrice <= order.stopPrice) { shouldFill = true; }
+        // BUY STOP:  triggers when price rises  to (or through) stopPrice
+        // SELL STOP: triggers when price falls  to (or through) stopPrice
+        if (order.side === 'BUY'  && currentPrice >= order.stopPrice) { shouldFill = true; fillPrice = currentPrice; }
+        if (order.side === 'SELL' && currentPrice <= order.stopPrice) { shouldFill = true; fillPrice = currentPrice; }
       }
 
       if (shouldFill) {
@@ -1336,7 +1573,7 @@ async function runMatchingLoop() {
           }
         }
         // Queue write to QuestDB trade_logs so the trade is visible per user_id
-        questdbWrites.push({ order: { ...order }, fillPrice, filledQty: order.quantity, status: 'FILLED' });
+        questdbWrites.push({ order: { ...order }, fillPrice, filledQty: order.quantity, statusEvent: 'ORDER_FILLED', opts: {} });
         changed = true;
       }
     });
@@ -1401,8 +1638,8 @@ async function runMatchingLoop() {
 
     // Write all new events to QuestDB trade_logs (non-blocking — fire-and-forget)
     if (questdbWrites.length) {
-      questdbWrites.forEach(({ order, fillPrice, filledQty, status }) => {
-        writeUserTradeToQuestDB(order, fillPrice, filledQty, status).catch(() => {});
+      questdbWrites.forEach(({ order, fillPrice, filledQty, statusEvent, opts }) => {
+        writeUserTradeToQuestDB(order, fillPrice, filledQty, statusEvent, opts || {}).catch(() => {});
       });
     }
   } catch (err) {
@@ -1412,11 +1649,163 @@ async function runMatchingLoop() {
 
 setInterval(runMatchingLoop, 1000);
 
+// ─── SSE: Real-time user orders stream ──────────────────────────────────────
+// GET /api/user/orders/stream — pushes the authenticated user's full order list
+// every 2 s so the frontend can update all tabs without manual polling.
+app.get('/api/user/orders/stream', (req, res) => {
+  // SSE cannot send custom headers; accept token in ?token= query param OR header
+  const token = req.query.token || (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) { res.status(401).end(); return; }
+  let userId;
+  try {
+    const decoded = jwt.verify(token, USER_JWT_SECRET);
+    userId = decoded.id;
+  } catch { res.status(401).end(); return; }
+
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let closed = false;
+  req.on('close', () => { closed = true; clearInterval(iv); });
+
+  async function pushOrders() {
+    if (closed) return;
+    try {
+      let quotes = [];
+      try { quotes = await fetchMarketQuotes(); } catch {}
+      const priceMap = {};
+      quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
+
+      const orders = readUserOrders()
+        .filter(o => o.userId === userId)
+        .map(o => ({
+          id            : o.id,
+          symbol        : o.symbol,
+          name          : o.name,
+          side          : o.side,
+          type          : o.orderType,
+          orderType     : o.orderType,
+          quantity      : o.quantity,
+          price         : o.price,
+          stopPrice     : o.stopPrice,
+          targetPrice   : o.targetPrice,
+          stopLoss      : o.stopLoss,
+          filledQuantity: o.filledQuantity,
+          averagePrice  : o.averagePrice,
+          status        : o.status,
+          validity      : o.validity,
+          fees          : o.fees,
+          timestamp     : o.timestamp,
+          fillTimestamp : o.fillTimestamp,
+          cancelledAt   : o.cancelledAt,
+          expiredAt     : o.expiredAt,
+          isAutoOrder   : o.isAutoOrder,
+          autoReason    : o.autoReason,
+          ltp           : priceMap[o.symbol] || null,
+        }));
+
+      const positions = computeUserPositions(userId, priceMap);
+
+      if (!closed) res.write(`data: ${JSON.stringify({ orders, positions })}\n\n`);
+    } catch (err) {
+      if (!closed) res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    }
+  }
+
+  pushOrders();
+  const iv = setInterval(pushOrders, 2000);
+});
+
+// ─── Historical OHLCV endpoint ───────────────────────────────────────────────
+// GET /api/market/historical/:instrumentId?interval=1D&limit=90
+// Aggregates real trade_logs candles from QuestDB. Falls back to synthetic
+// candles derived from the instrument's base price when the table is empty.
+app.get('/api/market/historical/:instrumentId', async (req, res) => {
+  const inst = resolveInstrument(req.params.instrumentId);
+  if (!inst) return res.status(404).json({ error: 'Unknown instrument' });
+
+  const limitRaw   = parseInt(req.query.limit, 10) || 90;
+  const limit      = Math.min(limitRaw, 500);
+  const interval   = req.query.interval || '1D';
+
+  // Map interval label → QuestDB sample-by unit
+  const UNIT_MAP = {
+    '1s': '1s', '5s': '5s', '30s': '30s',
+    '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+    '1h': '1h', '2h': '2h', '4h': '4h',
+    '1D': '1d', '1W': '7d',
+  };
+  const unit = UNIT_MAP[interval] || '1d';
+
+  try {
+    // Try to build real OHLCV from trade_logs for this instrument
+    const rows = await questdb(`
+      SELECT
+        timestamp,
+        first(price) AS open,
+        max(price)   AS high,
+        min(price)   AS low,
+        last(price)  AS close,
+        sum(quantity) AS volume
+      FROM trade_logs
+      WHERE instrument_id = '${inst.id}'
+        AND order_status_event = 'ORDER_FILLED'
+      SAMPLE BY ${unit}
+      ORDER BY timestamp DESC
+      LIMIT ${limit}
+    `).catch(() => []);
+
+    if (rows.length > 0) {
+      const candles = rows
+        .reverse()
+        .map(r => ({
+          time  : new Date(r.timestamp).getTime(),
+          open  : r.open,
+          high  : r.high,
+          low   : r.low,
+          close : r.close,
+          volume: r.volume || 0,
+        }));
+      return res.json(candles);
+    }
+
+    // No data yet — build synthetic candles from the instrument's base price
+    // using a deterministic random walk so the chart is at least plausible.
+    const candles   = [];
+    const now       = Date.now();
+    const unitMs    = { '1s': 1000, '5s': 5000, '30s': 30000, '1m': 60000, '5m': 300000,
+                        '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000,
+                        '4h': 14400000, '1d': 86400000, '7d': 604800000 };
+    const stepMs    = unitMs[unit] || 86400000;
+
+    let price = inst.basePrice;
+    for (let i = limit - 1; i >= 0; i--) {
+      const time    = now - i * stepMs;
+      const open    = price;
+      const pct     = (Math.sin(i * 0.37 + inst.id * 1.7) * 0.5 + Math.cos(i * 0.13) * 0.3) * 0.015;
+      const close   = Math.max(open * (1 + pct), 1);
+      const high    = Math.max(open, close) * (1 + Math.abs(pct) * 0.3);
+      const low     = Math.min(open, close) * (1 - Math.abs(pct) * 0.3);
+      const volume  = Math.floor(Math.abs(Math.sin(i + 3)) * 500000 + 50000);
+      candles.push({ time, open, high, low, close, volume });
+      price = close;
+    }
+    res.json(candles);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const server = app.listen(PORT, () => {
   console.log(`✅  KTrade Admin API  →  http://localhost:${PORT}/api/admin`);
   console.log(`   QuestDB            →  ${QUESTDB_URL}`);
   console.log(`   Instruments loaded →  ${Object.keys(INSTRUMENTS).length}`);
   console.log(`   SSE stream         →  /api/admin/orders/book/:id/stream`);
+  console.log(`   User orders SSE    →  /api/user/orders/stream`);
+  console.log(`   Historical OHLCV   →  /api/market/historical/:instrumentId`);
 });
 
 server.on('error', (err) => {

@@ -16,6 +16,10 @@ function toSymbol(inst: any): Symbol {
     volume       : inst.volume     ?? 0,
     change       : inst.change     ?? 0,
     changePercent: inst.changePercent ?? 0,
+    // Circuit-breaker fields from backend
+    circuitStatus: inst.circuitStatus ?? 'NONE',
+    circuitBand  : inst.circuitBand   ?? 0,
+    basePrice    : inst.basePrice     ?? inst.marketPrice ?? 0,
   };
 }
 
@@ -58,50 +62,30 @@ class MarketDataService {
     }
   }
 
-  async getHistoricalData(symbol: string, timeframe: string = '1m', limit: number = 500): Promise<OHLCV[]> {
-    const sym = await this.getSymbol(symbol);
-    if (!sym) return [];
-
-    const candles: OHLCV[] = [];
-    const basePrice = sym.price;
-    const now = Date.now();
-    let price = basePrice * 0.95;
-    const interval = timeframe === '1m' ? 60000 : timeframe === '5m' ? 300000 : 3600000;
-
-    for (let i = limit - 1; i >= 0; i--) {
-      const time       = now - (i * interval);
-      const open       = price;
-      const change     = (Math.random() - 0.48) * price * 0.02;
-      price            = Math.max(open + change, price * 0.95);
-      const high       = Math.max(open, price) * (1 + Math.random() * 0.01);
-      const low        = Math.min(open, price) * (1 - Math.random() * 0.01);
-      const volume     = Math.floor(Math.random() * 1000000) + 100000;
-      candles.push({ time, open, high, low, close: price, volume });
-    }
-    return candles;
-  }
-
-  async getOrderBook(symbol: string): Promise<any> {
+  async getHistoricalData(symbol: string, timeframe: string = '1D', limit: number = 90): Promise<OHLCV[]> {
     try {
-      const response = await apiClient.get(`/market/orderbook/${symbol}`);
-      return response.data;
-    } catch {
-      return { bids: [], asks: [], lastUpdate: Date.now() };
-    }
-  }
-
-  async getMarketDepth(symbol: string): Promise<any> {
-    try {
-      const ob = await this.getOrderBook(symbol);
-      return { bids: ob.bids || [], asks: ob.asks || [], lastUpdate: ob.lastUpdate || Date.now() };
-    } catch {
-      return { bids: [], asks: [], lastUpdate: Date.now() };
+      const encodedSymbol = encodeURIComponent(symbol);
+      const response = await apiClient.get(
+        `/market/historical/${encodedSymbol}?interval=${timeframe}&limit=${limit}`
+      );
+      return (response.data as any[]).map((c: any) => ({
+        time  : c.time,
+        open  : c.open,
+        high  : c.high,
+        low   : c.low,
+        close : c.close,
+        volume: c.volume || 0,
+      }));
+    } catch (error) {
+      console.error('Failed to fetch historical data from backend:', error);
+      return [];
     }
   }
 
   async getOHLCVData(symbol: string, interval: string, from: number, to: number): Promise<OHLCV[]> {
-    const days = Math.ceil((to - from) / (24 * 60 * 60 * 1000));
-    return this.getHistoricalData(symbol, interval, days * 24);
+    const days  = Math.ceil((to - from) / (24 * 60 * 60 * 1000));
+    const limit = Math.min(Math.max(days, 1) * (interval === '1D' ? 1 : 24), 500);
+    return this.getHistoricalData(symbol, interval, limit);
   }
 
   // ── SSE-based real-time market data stream ──────────────────────────────────

@@ -11,6 +11,11 @@ export interface Symbol {
   high?: number;
   low?: number;
   open?: number;
+  // Circuit-breaker fields (populated by the backend)
+  // circuitStatus: 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE'
+  circuitStatus?: 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE';
+  circuitBand?: number;   // 2 | 5 | 10 | 20  (0 = no circuit)
+  basePrice?: number;     // reference price used for circuit calculation
 }
 
 export interface OHLCV {
@@ -37,7 +42,7 @@ export interface MarketDepth {
 
 export type OrderType = 'MARKET' | 'LIMIT' | 'STOP' | 'STOP_LIMIT';
 export type OrderSide = 'BUY' | 'SELL';
-export type OrderStatus = 'PENDING' | 'OPEN' | 'FILLED' | 'CANCELLED' | 'REJECTED' | 'PARTIAL';
+export type OrderStatus = 'PENDING' | 'OPEN' | 'FILLED' | 'CANCELLED' | 'REJECTED' | 'PARTIAL' | 'EXPIRED';
 export type OrderValidity = 'INTRADAY' | 'OVERNIGHT';
 
 export interface Order {
@@ -57,6 +62,10 @@ export interface Order {
   fees: number;
   timestamp: number;
   fillTimestamp?: number;
+  // Circuit breaker fields (present on order-placement response)
+  circuitStatus?: 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE';
+  circuitBand?: number;
+  circuitWarning?: string | null;
 }
 
 export interface Position {

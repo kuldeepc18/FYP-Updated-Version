@@ -4,9 +4,10 @@ import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { ArrowUpRight, TrendingUp, TrendingDown, Wallet, BarChart3, Activity } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '@/store/hooks';
-import { setSymbols, setSelectedSymbol, setPositions, updateAccount } from '@/store/tradingSlice';
+import { setSymbols, setSelectedSymbol, setPositions, updateAccount, setOrders } from '@/store/tradingSlice';
 import { updateUserBalance } from '@/store/authSlice';
 import { marketDataService } from '@/services';
+import { orderServiceApi } from '@/services/orderServiceApi';
 import { apiClient } from '@/config/api';
 import { Symbol, Position } from '@/types/trading';
 import { cn } from '@/lib/utils';
@@ -76,13 +77,16 @@ const Dashboard = () => {
     };
   }, [dispatch]);
 
-  // ── Poll positions every 3 s & balance every 10 s ─────────────────────────
+  // ── Poll positions + orders every 3 s & balance every 10 s ──────────────
   useEffect(() => {
+    // Initial fetch
     fetchPositions();
     fetchBalance();
+    orderServiceApi.getOrders().then(o => dispatch(setOrders(o))).catch(() => {});
 
     posIntervalRef.current = setInterval(() => {
       fetchPositions();
+      orderServiceApi.getOrders().then(o => dispatch(setOrders(o))).catch(() => {});
     }, 3000);
 
     // Refresh balance every 10 s to catch fills that affect balance
@@ -92,7 +96,7 @@ const Dashboard = () => {
       if (posIntervalRef.current) clearInterval(posIntervalRef.current);
       clearInterval(balInterval);
     };
-  }, [fetchPositions, fetchBalance]);
+  }, [fetchPositions, fetchBalance, dispatch]);
 
   // ── Sync auth balance → trading account (so TopNav & Dashboard agree) ─────
   useEffect(() => {

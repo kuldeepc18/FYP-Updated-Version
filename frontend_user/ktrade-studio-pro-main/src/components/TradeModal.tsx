@@ -1,16 +1,17 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { OrderType, OrderSide, OrderValidity } from '@/types/trading';
 import { orderServiceApi } from '@/services';
 import { useAppDispatch, useAppSelector } from '@/store/hooks';
 import { addOrder } from '@/store/tradingSlice';
 import { toast } from 'sonner';
-import { TrendingUp, TrendingDown } from 'lucide-react';
+import { TrendingUp, TrendingDown, AlertTriangle, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
 
 interface TradeModalProps {
   symbol: string;
@@ -50,6 +51,40 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
 
   const displayBalance = authUser?.balance ?? account.availableMargin;
 
+  // ── Real-time circuit breaker warning ─────────────────────────────────────
+  // Compute how far the entered limit price deviates from the current LTP.
+  // NSE circuit bands: 2 %, 5 %, 10 %, 20 %.  We warn for every band breached.
+  const circuitInfo = useMemo(() => {
+    if (orderType === 'MARKET' || !price || currentPrice <= 0) return null;
+    const limitPrice = parseFloat(price);
+    if (!limitPrice || limitPrice <= 0) return null;
+
+    const pctDiff    = ((limitPrice - currentPrice) / currentPrice) * 100;
+    const BANDS      = [20, 10, 5, 2] as const;
+
+    for (const band of BANDS) {
+      if (pctDiff >= band) {
+        return {
+          type   : 'UPPER_CIRCUIT' as const,
+          band,
+          pctDiff,
+          limitPrice,
+          ltp    : currentPrice,
+        };
+      }
+      if (pctDiff <= -band) {
+        return {
+          type   : 'LOWER_CIRCUIT' as const,
+          band,
+          pctDiff,
+          limitPrice,
+          ltp    : currentPrice,
+        };
+      }
+    }
+    return null;
+  }, [price, currentPrice, orderType]);
+
   const handlePlaceOrder = async () => {
     if (qty <= 0) { toast.error('Enter a valid quantity'); return; }
     if (orderType !== 'MARKET' && !price) { toast.error('Price is required for limit orders'); return; }
@@ -69,7 +104,14 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
         validity,
       });
       dispatch(addOrder(order));
-      toast.success(`Order placed: ${side} ${qty} ${symbol} @ ${orderType === 'MARKET' ? 'Market' : `₹${price}`}`);
+
+      // Show circuit warning as a persistent toast if the API flagged one
+      if (order.circuitWarning) {
+        toast.warning(order.circuitWarning, { duration: 8000 });
+      } else {
+        toast.success(`Order placed: ${side} ${qty} ${symbol} @ ${orderType === 'MARKET' ? 'Market' : `₹${price}`}`);
+      }
+
       // Reset form
       setQuantity('1');
       setPrice('');
@@ -90,7 +132,20 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
-            <span>{symbol}</span>
+            <span className="flex items-center gap-2">
+              {symbol}
+              {/* Circuit breaker badge from live market data */}
+              {symData?.circuitStatus === 'UPPER_CIRCUIT' && (
+                <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold bg-orange-100 text-orange-700 border border-orange-300 dark:bg-orange-900/40 dark:text-orange-300">
+                  <ArrowUpCircle className="w-3 h-3" /> UC {symData.circuitBand}%
+                </span>
+              )}
+              {symData?.circuitStatus === 'LOWER_CIRCUIT' && (
+                <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold bg-blue-100 text-blue-700 border border-blue-300 dark:bg-blue-900/40 dark:text-blue-300">
+                  <ArrowDownCircle className="w-3 h-3" /> LC {symData.circuitBand}%
+                </span>
+              )}
+            </span>
             <div className="flex items-center gap-3 text-sm">
               <span className="text-muted-foreground">LTP</span>
               <span className="font-bold text-lg">₹{currentPrice.toFixed(2)}</span>
@@ -163,6 +218,34 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
                   value={price}
                   onChange={(e) => setPrice(e.target.value)}
                 />
+
+                {/* Real-time circuit breaker warning shown while user types */}
+                {circuitInfo && (
+                  <Alert
+                    className={
+                      circuitInfo.type === 'UPPER_CIRCUIT'
+                        ? 'border-orange-400 bg-orange-50 dark:bg-orange-950/30'
+                        : 'border-blue-400 bg-blue-50 dark:bg-blue-950/30'
+                    }
+                  >
+                    {circuitInfo.type === 'UPPER_CIRCUIT'
+                      ? <ArrowUpCircle className="h-4 w-4 text-orange-500" />
+                      : <ArrowDownCircle className="h-4 w-4 text-blue-500" />}
+                    <AlertDescription className="text-xs leading-snug ml-6 -mt-4">
+                      <span className={circuitInfo.type === 'UPPER_CIRCUIT' ? 'font-bold text-orange-600' : 'font-bold text-blue-600'}>
+                        {circuitInfo.type === 'UPPER_CIRCUIT' ? '⬆ UPPER CIRCUIT' : '⬇ LOWER CIRCUIT'} ({circuitInfo.band}% band)
+                      </span>
+                      {' '}— Your limit price ₹{circuitInfo.limitPrice.toFixed(2)} is{' '}
+                      <strong>{Math.abs(circuitInfo.pctDiff).toFixed(1)}%</strong>{' '}
+                      {circuitInfo.type === 'UPPER_CIRCUIT' ? 'above' : 'below'} the current LTP ₹{circuitInfo.ltp.toFixed(2)}.
+                      <br />
+                      This order will stay <strong>PENDING</strong> until the market gradually moves to your price.
+                      {validity === 'INTRADAY'
+                        ? ' As an INTRADAY order it will expire at 3:30 PM IST if not filled.'
+                        : ' As an OVERNIGHT order it will persist until filled or manually cancelled.'}
+                    </AlertDescription>
+                  </Alert>
+                )}
               </div>
             )}
 

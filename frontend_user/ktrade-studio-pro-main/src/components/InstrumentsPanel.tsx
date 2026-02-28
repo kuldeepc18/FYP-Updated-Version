@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
-import { Search, Plus, Check, TrendingUp, TrendingDown } from 'lucide-react';
+import { Search, Plus, Check, TrendingUp, TrendingDown, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '@/store/hooks';
 import { setSelectedSymbol, addToWatchlist } from '@/store/tradingSlice';
 import { cn } from '@/lib/utils';
@@ -65,9 +65,11 @@ export const InstrumentsPanel = () => {
             </p>
           )}
           {filtered.map((sym) => {
-            const isSelected  = selectedSymbol === sym.symbol;
-            const isPositive  = (sym.changePercent || 0) >= 0;
-            const inWatchlist = watchlistSymbols.includes(sym.symbol);
+            const isSelected    = selectedSymbol === sym.symbol;
+            const isPositive    = (sym.changePercent || 0) >= 0;
+            const inWatchlist   = watchlistSymbols.includes(sym.symbol);
+            const isUpperCircuit = sym.circuitStatus === 'UPPER_CIRCUIT';
+            const isLowerCircuit = sym.circuitStatus === 'LOWER_CIRCUIT';
 
             return (
               <div
@@ -81,13 +83,34 @@ export const InstrumentsPanel = () => {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="font-semibold text-sm truncate">{sym.symbol}</span>
+                    {/* Circuit breaker badge */}
+                    {isUpperCircuit && (
+                      <span
+                        title={`Upper Circuit ${sym.circuitBand}% band — price has risen ≥ ${sym.circuitBand}% from reference`}
+                        className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-orange-100 text-orange-700 border border-orange-300 dark:bg-orange-900/40 dark:text-orange-300 shrink-0"
+                      >
+                        <ArrowUpCircle className="w-2.5 h-2.5" /> UC
+                      </span>
+                    )}
+                    {isLowerCircuit && (
+                      <span
+                        title={`Lower Circuit ${sym.circuitBand}% band — price has fallen ≥ ${sym.circuitBand}% from reference`}
+                        className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-blue-100 text-blue-700 border border-blue-300 dark:bg-blue-900/40 dark:text-blue-300 shrink-0"
+                      >
+                        <ArrowDownCircle className="w-2.5 h-2.5" /> LC
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground truncate mt-0.5">{sym.name}</p>
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0">
                   <div className="text-right">
-                    <div className="font-semibold text-sm">₹{sym.price.toFixed(2)}</div>
+                    <div className={cn(
+                      "font-semibold text-sm",
+                      isUpperCircuit && "text-orange-600 dark:text-orange-400",
+                      isLowerCircuit && "text-blue-600 dark:text-blue-400",
+                    )}>₹{sym.price.toFixed(2)}</div>
                     <div
                       className={cn(
                         'text-xs flex items-center justify-end gap-1',

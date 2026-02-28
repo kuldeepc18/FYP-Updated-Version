@@ -9,8 +9,11 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks';
 import { setOrders, cancelOrder, setPositions, setMyTrades } from '@/store/tradingSlice';
 import { orderServiceApi } from '@/services/orderServiceApi';
 import { cn } from '@/lib/utils';
-import { X, ChevronUp, ChevronDown, LogOut, Target } from 'lucide-react';
+import { X, ChevronUp, ChevronDown, LogOut, Target, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
 import { toast } from 'sonner';
+
+const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:3000/api')
+  .replace(/\/api$/, '');
 
 interface EditDialog {
   open: boolean;
@@ -31,9 +34,10 @@ export const OrdersPanel = () => {
   const [savingEdit,    setSavingEdit]    = useState(false);
   const [exitingAll,    setExitingAll]    = useState(false);
   const [exitingSymbol, setExitingSymbol] = useState<string | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const sseRef      = useRef<EventSource | null>(null);
+  const pollRef     = useRef<NodeJS.Timeout | null>(null);
 
-  // ── Poll every 3 s ────────────────────────────────────────────────────────
+  // ── HTTP fallback fetch (used when SSE is unavailable) ───────────────────
   const fetchAll = useCallback(async () => {
     try {
       const [fetchedOrders, fetchedPositions, fetchedMyTrades] = await Promise.all([
@@ -47,11 +51,108 @@ export const OrdersPanel = () => {
     } catch { /* silent */ }
   }, [dispatch]);
 
+  // ── SSE-based real-time order/position stream ─────────────────────────────
+  // Opens /api/user/orders/stream which pushes { orders, positions } every 2 s.
+  // Falls back to 3-second HTTP polling if SSE fails or token is missing.
   useEffect(() => {
-    fetchAll();
-    intervalRef.current = setInterval(fetchAll, 3000);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [fetchAll]);
+    let closed = false;
+
+    function openSSE() {
+      if (closed) return;
+      const authRaw = localStorage.getItem('ktrade_auth');
+      if (!authRaw) { startPolling(); return; }
+      let token = '';
+      try { token = JSON.parse(authRaw).token || ''; } catch { startPolling(); return; }
+      if (!token) { startPolling(); return; }
+
+      const url = `${API_BASE}/api/user/orders/stream?token=${encodeURIComponent(token)}`;
+      const es  = new EventSource(url);
+      sseRef.current = es;
+
+      es.onmessage = (event) => {
+        if (closed) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.orders) {
+            const orders = (data.orders as any[]).map(d => ({
+              id            : d.id,
+              symbol        : d.symbol,
+              name          : d.name,
+              side          : d.side,
+              type          : d.orderType || d.type,
+              orderType     : d.orderType || d.type,
+              quantity      : d.quantity,
+              price         : d.price,
+              stopPrice     : d.stopPrice,
+              targetPrice   : d.targetPrice,
+              stopLoss      : d.stopLoss,
+              filledQuantity: d.filledQuantity || 0,
+              averagePrice  : d.averagePrice,
+              status        : d.status,
+              validity      : d.validity,
+              fees          : d.fees || 0,
+              timestamp     : d.timestamp,
+              fillTimestamp : d.fillTimestamp,
+              cancelledAt   : d.cancelledAt,
+              expiredAt     : d.expiredAt,
+              isAutoOrder   : d.isAutoOrder,
+              autoReason    : d.autoReason,
+              ltp           : d.ltp,
+            }));
+            dispatch(setOrders(orders));
+          }
+          if (data.positions) {
+            const positions = (data.positions as any[]).map(p => ({
+              symbol              : p.symbol,
+              quantity            : p.quantity,
+              averagePrice        : p.averagePrice,
+              currentPrice        : p.currentPrice || p.averagePrice,
+              unrealizedPnl       : p.unrealizedPnl || 0,
+              unrealizedPnlPercent: p.unrealizedPnlPercent || 0,
+              side                : p.side || 'BUY',
+              timestamp           : p.timestamp || Date.now(),
+            }));
+            dispatch(setPositions(positions));
+          }
+        } catch { /* ignore parse errors */ }
+      };
+
+      es.onerror = () => {
+        es.close();
+        sseRef.current = null;
+        if (!closed) {
+          // SSE failed — fall back to HTTP polling
+          startPolling();
+        }
+      };
+    }
+
+    function startPolling() {
+      if (closed || pollRef.current) return;
+      fetchAll();
+      pollRef.current = setInterval(fetchAll, 3000);
+    }
+
+    // Initial HTTP fetch for immediate data, then open SSE
+    fetchAll().then(() => {
+      // Also fetch myTrades separately (SSE only pushes orders+positions)
+      orderServiceApi.getMyTrades().then(trades => dispatch(setMyTrades(trades))).catch(() => {});
+    });
+    openSSE();
+
+    // Refresh myTrades every 5 s regardless of SSE state
+    const myTradesInterval = setInterval(() => {
+      orderServiceApi.getMyTrades().then(trades => dispatch(setMyTrades(trades))).catch(() => {});
+    }, 5000);
+
+    return () => {
+      closed = true;
+      sseRef.current?.close();
+      sseRef.current = null;
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      clearInterval(myTradesInterval);
+    };
+  }, [dispatch, fetchAll]);
 
   // ── Live LTP from SSE store ───────────────────────────────────────────────
   const getLTP = (sym: string) => symbols.find((s) => s.symbol === sym)?.price;
@@ -66,7 +167,10 @@ export const OrdersPanel = () => {
   });
 
   const pendingOrders = orders.filter((o) => o.status === 'PENDING' || o.status === 'PARTIAL');
-  const historyOrders = orders.filter((o) => o.status === 'EXPIRED' || o.status === 'CANCELLED');
+  // History shows ALL completed orders: FILLED, CANCELLED, EXPIRED
+  const historyOrders = orders.filter((o) =>
+    o.status === 'FILLED' || o.status === 'CANCELLED' || o.status === 'EXPIRED'
+  );
 
   // ── Cancel pending order ──────────────────────────────────────────────────
   const handleCancel = async (orderId: string) => {
@@ -288,10 +392,52 @@ export const OrdersPanel = () => {
                     <tbody className="divide-y">
                       {pendingOrders.length === 0 ? (
                         <tr><td colSpan={8} className="text-center text-muted-foreground py-8 text-sm">No pending orders</td></tr>
-                      ) : pendingOrders.map((o) => (
-                        <tr key={o.id} className="hover:bg-muted/30">
+                      ) : pendingOrders.map((o) => {
+                        const ltp          = getLTP(o.symbol);
+                        const limitPrice   = o.price;
+                        // Circuit deviation of the ORDER's limit price vs current LTP
+                        const pctDiff      = (ltp && limitPrice && ltp > 0)
+                          ? ((limitPrice - ltp) / ltp) * 100
+                          : null;
+                        const isUpperCirc  = pctDiff !== null && pctDiff  >=  20;
+                        const isLowerCirc  = pctDiff !== null && pctDiff  <= -20;
+                        const isModCirc    = !isUpperCirc && !isLowerCirc && pctDiff !== null && Math.abs(pctDiff) >= 5;
+
+                        // Also check live symbol circuit status
+                        const symInfo      = symbols.find(s => s.symbol === o.symbol);
+                        const symInUC      = symInfo?.circuitStatus === 'UPPER_CIRCUIT';
+                        const symInLC      = symInfo?.circuitStatus === 'LOWER_CIRCUIT';
+
+                        return (
+                        <tr key={o.id} className={cn(
+                          'hover:bg-muted/30',
+                          (isUpperCirc || symInUC) && 'bg-orange-50/30 dark:bg-orange-950/10',
+                          (isLowerCirc || symInLC) && 'bg-blue-50/30 dark:bg-blue-950/10',
+                        )}>
                           <td className="py-2 px-4 text-muted-foreground text-xs">{new Date(o.timestamp).toLocaleTimeString()}</td>
-                          <td className="py-2 px-4 font-medium">{o.symbol}</td>
+                          <td className="py-2 px-4 font-medium">
+                            <div className="flex items-center gap-1">
+                              {o.symbol}
+                              {(symInUC || isUpperCirc) && (
+                                <span title="Upper Circuit — order price is ≥20% above LTP"
+                                  className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-orange-100 text-orange-700 border border-orange-300 dark:bg-orange-900/40 dark:text-orange-300">
+                                  <ArrowUpCircle className="w-2.5 h-2.5" /> UC
+                                </span>
+                              )}
+                              {(symInLC || isLowerCirc) && (
+                                <span title="Lower Circuit — order price is ≥20% below LTP"
+                                  className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-blue-100 text-blue-700 border border-blue-300 dark:bg-blue-900/40 dark:text-blue-300">
+                                  <ArrowDownCircle className="w-2.5 h-2.5" /> LC
+                                </span>
+                              )}
+                              {isModCirc && !isUpperCirc && !isLowerCirc && (
+                                <span title={`Order price is ${pctDiff!.toFixed(1)}% from LTP — may take time to fill`}
+                                  className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-yellow-100 text-yellow-700 border border-yellow-300 dark:bg-yellow-900/40 dark:text-yellow-300">
+                                  ±{Math.abs(pctDiff!).toFixed(0)}%
+                                </span>
+                              )}
+                            </div>
+                          </td>
                           <td className="py-2 px-4">
                             <span className={o.side === 'BUY' ? 'text-success' : 'text-destructive'}>{o.side}</span>
                             <span className="text-muted-foreground ml-1 text-xs">{o.type}</span>
@@ -299,7 +445,16 @@ export const OrdersPanel = () => {
                           <td className="text-right py-2 px-4">{o.quantity}</td>
                           <td className="text-right py-2 px-4">{o.price ? `₹${o.price.toFixed(2)}` : 'Market'}</td>
                           <td className="text-right py-2 px-4 font-medium">
-                            {getLTP(o.symbol) != null ? `₹${getLTP(o.symbol)!.toFixed(2)}` : '—'}
+                            {ltp != null ? `₹${ltp.toFixed(2)}` : '—'}
+                            {pctDiff !== null && (
+                              <div className={cn(
+                                'text-[10px]',
+                                pctDiff > 0 ? 'text-orange-500' : 'text-blue-500',
+                                Math.abs(pctDiff) < 5 && 'text-muted-foreground',
+                              )}>
+                                {pctDiff > 0 ? '+' : ''}{pctDiff.toFixed(1)}% away
+                              </div>
+                            )}
                           </td>
                           <td className="text-center py-2 px-4">
                             <span className={cn('text-xs px-2 py-0.5 rounded-full font-medium', (o as any).validity === 'OVERNIGHT' ? 'bg-blue-500/20 text-blue-400' : 'bg-warning/20 text-warning')}>
@@ -312,7 +467,8 @@ export const OrdersPanel = () => {
                             </Button>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </ScrollArea>
@@ -357,7 +513,7 @@ export const OrdersPanel = () => {
                 </ScrollArea>
               </TabsContent>
 
-              {/* ── History (expired / cancelled) ────────────────────────── */}
+              {/* ── History (filled / expired / cancelled) ───────────────── */}
               <TabsContent value="history" className="flex-1 overflow-hidden m-0">
                 <ScrollArea className="h-full">
                   <table className="w-full text-sm">
@@ -373,19 +529,34 @@ export const OrdersPanel = () => {
                     </thead>
                     <tbody className="divide-y">
                       {historyOrders.length === 0 ? (
-                        <tr><td colSpan={6} className="text-center text-muted-foreground py-8 text-sm">No expired or cancelled orders</td></tr>
+                        <tr><td colSpan={6} className="text-center text-muted-foreground py-8 text-sm">No order history</td></tr>
                       ) : historyOrders.map((o) => (
                         <tr key={o.id} className="hover:bg-muted/30">
-                          <td className="py-2 px-4 text-muted-foreground text-xs">{new Date(o.timestamp).toLocaleTimeString()}</td>
+                          <td className="py-2 px-4 text-muted-foreground text-xs">
+                            {new Date(
+                              o.status === 'FILLED'    ? (o.fillTimestamp  || o.timestamp) :
+                              o.status === 'CANCELLED' ? ((o as any).cancelledAt || o.timestamp) :
+                              o.status === 'EXPIRED'   ? ((o as any).expiredAt   || o.timestamp) : o.timestamp
+                            ).toLocaleTimeString()}
+                          </td>
                           <td className="py-2 px-4 font-medium">{o.symbol}</td>
                           <td className="py-2 px-4">
                             <span className={o.side === 'BUY' ? 'text-success' : 'text-destructive'}>{o.side}</span>
                             <span className="text-muted-foreground ml-1 text-xs">{o.type}</span>
                           </td>
                           <td className="text-right py-2 px-4">{o.quantity}</td>
-                          <td className="text-right py-2 px-4">{o.price ? `₹${o.price.toFixed(2)}` : 'Market'}</td>
+                          <td className="text-right py-2 px-4">
+                            {o.status === 'FILLED' && o.averagePrice
+                              ? `₹${o.averagePrice.toFixed(2)}`
+                              : o.price ? `₹${o.price.toFixed(2)}` : 'Market'}
+                          </td>
                           <td className="text-center py-2 px-4">
-                            <span className={cn('text-xs px-2 py-0.5 rounded-full font-medium', o.status === 'EXPIRED' ? 'bg-orange-500/20 text-orange-400' : 'bg-muted text-muted-foreground')}>
+                            <span className={cn(
+                              'text-xs px-2 py-0.5 rounded-full font-medium',
+                              o.status === 'FILLED'    ? 'bg-success/20 text-success' :
+                              o.status === 'EXPIRED'   ? 'bg-orange-500/20 text-orange-400' :
+                              'bg-muted text-muted-foreground'
+                            )}>
                               {o.status}
                             </span>
                           </td>

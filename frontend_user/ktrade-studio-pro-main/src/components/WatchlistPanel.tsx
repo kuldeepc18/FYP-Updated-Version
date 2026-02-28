@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Plus, X, TrendingUp, TrendingDown, Search } from 'lucide-react';
+import { Plus, X, TrendingUp, TrendingDown, Search, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '@/store/hooks';
 import { setSelectedSymbol, addToWatchlist, removeFromWatchlist } from '@/store/tradingSlice';
 import { marketDataService } from '@/services';
@@ -123,6 +123,8 @@ export const WatchlistPanel = () => {
               const isPositive = (symData.changePercent || 0) >= 0;
               const price = symData.price || 0;
               const change = symData.changePercent || 0;
+              const isUpperCircuit = symData.circuitStatus === 'UPPER_CIRCUIT';
+              const isLowerCircuit = symData.circuitStatus === 'LOWER_CIRCUIT';
 
               return (
                 <div
@@ -134,13 +136,31 @@ export const WatchlistPanel = () => {
                   onClick={() => handleSymbolClick(symbol)}
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-sm">{symData.symbol}</div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-semibold text-sm">{symData.symbol}</span>
+                      {isUpperCircuit && (
+                        <span title={`Upper Circuit ${symData.circuitBand}% band`}
+                          className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-orange-100 text-orange-700 border border-orange-300 dark:bg-orange-900/40 dark:text-orange-300">
+                          <ArrowUpCircle className="w-2.5 h-2.5" /> UC
+                        </span>
+                      )}
+                      {isLowerCircuit && (
+                        <span title={`Lower Circuit ${symData.circuitBand}% band`}
+                          className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-bold bg-blue-100 text-blue-700 border border-blue-300 dark:bg-blue-900/40 dark:text-blue-300">
+                          <ArrowDownCircle className="w-2.5 h-2.5" /> LC
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-muted-foreground truncate">{symData.name}</p>
                   </div>
 
                   <div className="flex items-center gap-2">
                     <div className="text-right">
-                      <div className="font-semibold text-sm">₹{price.toFixed(2)}</div>
+                      <div className={cn(
+                        "font-semibold text-sm",
+                        isUpperCircuit && "text-orange-600 dark:text-orange-400",
+                        isLowerCircuit && "text-blue-600 dark:text-blue-400",
+                      )}>₹{price.toFixed(2)}</div>
                       <div className={cn(
                         'text-xs flex items-center justify-end gap-1',
                         isPositive ? 'text-success' : 'text-destructive'

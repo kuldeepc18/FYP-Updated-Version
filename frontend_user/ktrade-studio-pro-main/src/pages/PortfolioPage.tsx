@@ -1,10 +1,11 @@
-import { useEffect } from 'react';
+import { useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { useAppSelector, useAppDispatch } from '@/store/hooks';
-import { setSymbols } from '@/store/tradingSlice';
+import { setSymbols, setPositions } from '@/store/tradingSlice';
 import { marketDataService } from '@/services';
+import { orderServiceApi } from '@/services/orderServiceApi';
 import { cn } from '@/lib/utils';
 import { ArrowRight, TrendingUp, TrendingDown, Wallet, PieChart, BarChart3 } from 'lucide-react';
 import { Symbol } from '@/types/trading';
@@ -22,6 +23,20 @@ const PortfolioPage = () => {
     marketDataService.getSymbols().then(syms => { if (syms.length) dispatch(setSymbols(syms)); });
     return () => marketDataService.offMarketUpdate(onUpdate);
   }, [dispatch]);
+
+  // ── Fetch live positions from backend every 3 s ───────────────────────────
+  const fetchPositions = useCallback(async () => {
+    try {
+      const pos = await orderServiceApi.getPositions();
+      dispatch(setPositions(pos));
+    } catch { /* silent */ }
+  }, [dispatch]);
+
+  useEffect(() => {
+    fetchPositions();
+    const iv = setInterval(fetchPositions, 3000);
+    return () => clearInterval(iv);
+  }, [fetchPositions]);
 
   // Compute live P&L using SSE LTP instead of stale position.currentPrice
   const livePositions = positions.map(p => {
