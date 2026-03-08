@@ -251,12 +251,37 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (20 per instrument) to generate live order flow ──
-        for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
-            auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 20; ++i) {
+        // ── Start the pump-and-dump coordinator (instrument 1 — RELIANCE INDUSTRIES) ──
+        // Runs a single coordinator thread that drives a perpetual 3-phase cycle:
+        //   Phase 1 ACCUMULATION : manipulators 2500/2600/2700/2800 accumulate large
+        //     long positions via BUY orders filled by retail SELL counterparties.
+        //   Phase 2 PUMP : aggressive escalating BUY orders drive the price up;
+        //     retail momentum traders begin entering the market long at 110+.
+        //   Phase 3 DUMP : manipulators rapidly flood the book with large SELL orders,
+        //     collapsing the price and leaving retail traders trapped at the top.
+        // Must be started BEFORE mock traders so the coordinator is live before the
+        // idle MockTrader threads (IDs 2500/2600/2700/2800) begin their loops.
+        PumpDumpCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+        PumpDumpCoordinator::instance().start();
+
+        // ── Start 10 000 mock traders distributed round-robin across all instruments ──
+        // Trader IDs are assigned 0–9 999 in creation order by MockTrader::mockTraderCount.
+        // Traders 2500/2600/2700/2800 are pump-and-dump manipulators — their MockTrader
+        // threads stay idle while PumpDumpCoordinator drives all their orders.
+        // All other 9 996 traders behave as normal retail participants.
+        {
+            const auto& instruments = InstrumentManager::getInstance().getInstruments();
+            const int   instrCount  = static_cast<int>(instruments.size());
+            // 9 999 retail traders + 1 wash-trade manipulator (ID 2500) = 10 000 total.
+            constexpr int TOTAL_MOCK_TRADERS = 10000;
+            for (int t = 0; t < TOTAL_MOCK_TRADERS; ++t) {
+                // Round-robin: distribute traders evenly across instruments so every
+                // order book stays active and the wash trader's instrument (whichever
+                // it lands on) still has organic retail flow around it.
+                int instrId = instruments[t % instrCount].instrumentId;
+                auto ob     = orderBooks_[instrId];
                 mockTraders_.emplace_back(
-                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
+                    std::make_unique<MockTrader>(ob, instrId, &logger_));
                 mockTraders_.back()->start();
             }
         }
@@ -311,6 +336,10 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         running_ = false;
+
+        // Stop the pump-and-dump coordinator first so its thread finishes cleanly
+        // before mock-trader threads (which own the order books) are torn down.
+        PumpDumpCoordinator::instance().stop();
 
         // Stop all mock traders
         for (auto& trader : mockTraders_)

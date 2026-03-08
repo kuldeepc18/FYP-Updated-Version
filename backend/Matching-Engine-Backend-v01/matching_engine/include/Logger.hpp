@@ -252,7 +252,14 @@ public:
             << ",order_type=MATCH"
             << ",side="               << aggrSide
             << ",order_status_event=TRADE_MATCH"
-            << ",user_id="            << buyerUid
+            // user_id = aggressor's ID (the party that crossed the spread and
+            // triggered the match).  For BUY aggressors (pump phase) this is
+            // the manipulator buyer; for SELL aggressors (dump phase) this is
+            // the manipulator seller.  Using aggrUserId here ensures the
+            // manipulator's ID is always in user_id regardless of which side
+            // they are on, making user_id IN ('2500','2600','2700','2800')
+            // reliably catch BOTH pump and dump phase TRADE_MATCH rows.
+            << ",user_id="            << aggrUserId
             << ",trade_id="           << tradeId
             << ",buyer_user_id="      << buyerUid
             << ",seller_user_id="     << sellerUid
