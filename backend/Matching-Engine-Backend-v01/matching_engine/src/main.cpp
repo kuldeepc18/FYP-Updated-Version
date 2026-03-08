@@ -261,6 +261,10 @@ public:
             }
         }
 
+        // ── Start Layering coordinator (trader 2500 on instrument 1 — RELIANCE) ──
+        LayeringCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+        LayeringCoordinator::instance().start();
+
         // Main trading loop
         running_ = true;
         while (running_ && !g_shutdown.load()) {
@@ -311,6 +315,9 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         running_ = false;
+
+        // Stop layering coordinator
+        LayeringCoordinator::instance().stop();
 
         // Stop all mock traders
         for (auto& trader : mockTraders_)

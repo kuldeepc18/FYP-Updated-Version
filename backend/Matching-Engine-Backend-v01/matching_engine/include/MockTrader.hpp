@@ -249,6 +249,219 @@ inline const CircularRingCoordinator::StepSpec CircularRingCoordinator::CYCLE[8]
 };
 
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — LAYERING / SPOOFING  (trader ID 2500)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  LAYERING_ACTIVE   master on/off switch.
+//    true  → a dedicated coordinator thread places multiple large SELL orders
+//            at staggered price levels above the current market (the "wall"),
+//            waits for other participants to react to the artificial selling
+//            pressure, cancels all fake orders, and immediately buys at the
+//            now-depressed price.  The cycle repeats indefinitely.
+//    false → no layering manipulation; trader 2500 participates normally via
+//            its MockTrader thread (retail or wash, depending on other flags).
+//
+//  LAYERING_TRADER_ID   the user_id stamped on every layering order.
+//    QuestDB trade_logs will carry user_id = "2500" on all spoofed SELL
+//    orders, their cancellations, and the real BUY execution.
+//
+//  ML-detectable red flags in QuestDB trade_logs:
+//    ✦  Multiple large SELL ORDER_NEW rows at systematically spaced prices
+//       (2500/SELL/50000/ORDER_NEW × 5) in quick succession
+//    ✦  All 5 cancelled before execution (ORDER_CANCELLED × 5, same user)
+//    ✦  Immediately followed by a BUY on the opposite side (ORDER_FILLED)
+//    ✦  Size asymmetry: spoofed qty ≫ real qty (50 000 vs 3 000)
+//    ✦  Periodic cycle: wall → cancel → buy → pause → repeat
+//    ✦  Near-zero fill on the spoofed side; all real PnL on the opposite side
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   LAYERING_ACTIVE        = true;   // ← true → layering manipulation on
+static constexpr int    LAYERING_TRADER_ID     = 2500;
+static constexpr size_t LAYERING_SPOOF_QTY     = 50000;  // shares per fake sell order
+static constexpr size_t LAYERING_REAL_QTY      = 3000;   // shares for the real buy order
+static constexpr int    LAYERING_NUM_LEVELS    = 5;      // number of spoofed sell levels
+static constexpr double LAYERING_LEVEL_STEP    = 0.003;  // 0.3 % price gap between levels
+static constexpr int    LAYERING_PLACE_MS      = 200;    // ms between placing each fake order
+static constexpr int    LAYERING_INFLUENCE_MS  = 3000;   // ms sell wall stays visible
+static constexpr int    LAYERING_CANCEL_MS     = 100;    // ms between cancelling each fake order
+static constexpr int    LAYERING_PAUSE_MS      = 5000;   // ms idle between cycles
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LayeringCoordinator
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Singleton that runs a single dedicated thread executing the layering cycle:
+//    1. Place LAYERING_NUM_LEVELS large SELL limit orders above market price
+//    2. Sleep LAYERING_INFLUENCE_MS (wall visible, pressuring other traders)
+//    3. Cancel all fake SELL orders
+//    4. Place one BUY order at / near market price → should fill immediately
+//    5. Sleep LAYERING_PAUSE_MS → repeat
+//
+//  TradingApplication::start() calls:
+//    LayeringCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+//    LayeringCoordinator::instance().start();
+//  Cleanup calls:
+//    LayeringCoordinator::instance().stop();
+// ─────────────────────────────────────────────────────────────────────────────
+class LayeringCoordinator {
+public:
+    static LayeringCoordinator& instance() {
+        static LayeringCoordinator inst;
+        return inst;
+    }
+
+    void init(std::shared_ptr<OrderBook> ob, Logger* log, int instrId) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        orderBook_ = ob;
+        logger_    = log;
+        instrId_   = instrId;
+    }
+
+    void start() {
+        if (!LAYERING_ACTIVE) return;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!orderBook_) return;
+            running_ = true;
+        }
+        thread_ = std::thread(&LayeringCoordinator::layeringLoop, this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            running_ = false;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void layeringLoop() {
+        const std::string traderId = std::to_string(LAYERING_TRADER_ID);
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (!running_) break;
+            }
+
+            // ── Get current market price ─────────────────────────────────────
+            const Instrument* instr =
+                InstrumentManager::getInstance().getInstrumentById(instrId_);
+            double marketPrice = instr ? instr->marketPrice : 100.0;
+
+            // ══════════════════════════════════════════════════════════════════
+            //  STEP 1 — Create artificial sell wall
+            //  Place LAYERING_NUM_LEVELS large SELL orders at prices above
+            //  the current market, each LAYERING_LEVEL_STEP (0.3 %) apart.
+            //
+            //  Expected QuestDB rows:
+            //    user_id=2500, side=SELL, qty=50000, status=ORDER_NEW  × 5
+            // ══════════════════════════════════════════════════════════════════
+            std::vector<std::shared_ptr<Order>> spoofOrders;
+            spoofOrders.reserve(LAYERING_NUM_LEVELS);
+
+            for (int i = 0; i < LAYERING_NUM_LEVELS; ++i) {
+                double sellPrice = std::round(
+                    marketPrice * (1.0 + LAYERING_LEVEL_STEP * (i + 1))
+                    * 100.0) / 100.0;
+
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, OrderSide::SELL,
+                    sellPrice, LAYERING_SPOOF_QTY,
+                    TimeInForce::GTC, traderId, instrId_);
+
+                orderBook_->addOrder(order);
+                if (logger_) logger_->logOrder(*order);
+                spoofOrders.push_back(order);
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(LAYERING_PLACE_MS));
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) return;
+                }
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            //  INFLUENCE PERIOD — sell wall remains visible in the order book
+            //  for LAYERING_INFLUENCE_MS.  Other traders see massive supply and
+            //  may react by selling or pulling their bids.
+            // ══════════════════════════════════════════════════════════════════
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(LAYERING_INFLUENCE_MS));
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (!running_) return;
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            //  STEP 2 — Cancel all fake sell orders
+            //  The large orders were never intended for execution.
+            //
+            //  Expected QuestDB rows:
+            //    user_id=2500, side=SELL, qty=50000, status=ORDER_CANCELLED × 5
+            // ══════════════════════════════════════════════════════════════════
+            for (auto& order : spoofOrders) {
+                orderBook_->cancelOrder(order->getOrderId());
+                if (order->getStatus() == OrderStatus::CANCELLED) {
+                    if (logger_) logger_->logOrder(*order);
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(LAYERING_CANCEL_MS));
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) return;
+                }
+            }
+            spoofOrders.clear();
+
+            // ══════════════════════════════════════════════════════════════════
+            //  STEP 3 — Execute the real trade
+            //  Place a BUY order at or near the best available ask price.
+            //  After the sell wall depressed sentiment, this order profits
+            //  from lower prices.
+            //
+            //  Expected QuestDB row:
+            //    user_id=2500, side=BUY, qty=3000, status=ORDER_FILLED
+            // ══════════════════════════════════════════════════════════════════
+            double buyPrice;
+            {
+                double bestAsk = orderBook_->getBestAskPrice();
+                if (bestAsk > 0.0)
+                    buyPrice = bestAsk;  // match against best available sell
+                else
+                    buyPrice = std::round(marketPrice * 0.997 * 100.0) / 100.0;
+            }
+
+            auto buyOrder = std::make_shared<Order>(
+                OrderType::LIMIT, OrderSide::BUY,
+                buyPrice, LAYERING_REAL_QTY,
+                TimeInForce::GTC, traderId, instrId_);
+
+            orderBook_->addOrder(buyOrder);
+            if (logger_) logger_->logOrder(*buyOrder);
+
+            // ══════════════════════════════════════════════════════════════════
+            //  PAUSE — idle before next layering cycle
+            // ══════════════════════════════════════════════════════════════════
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(LAYERING_PAUSE_MS));
+        }
+    }
+
+    LayeringCoordinator()  = default;
+    ~LayeringCoordinator() { stop(); }
+    LayeringCoordinator(const LayeringCoordinator&) = delete;
+    LayeringCoordinator& operator=(const LayeringCoordinator&) = delete;
+
+    std::shared_ptr<OrderBook>  orderBook_;
+    Logger*                     logger_  = nullptr;
+    int                         instrId_ = 1;
+    bool                        running_ = false;
+    std::mutex                  mtx_;
+    std::thread                 thread_;
+};
+
+
 class MockTrader {
 public:
     static int mockTraderCount;
