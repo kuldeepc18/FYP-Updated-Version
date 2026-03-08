@@ -248,6 +248,361 @@ inline const CircularRingCoordinator::StepSpec CircularRingCoordinator::CYCLE[8]
     {0, OrderSide::SELL, false},  // step 7 : 2500 SELL — matches 2800's BUY  ★
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — PUMP AND DUMP  (traders 2500, 2600, 2700, 2800)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  PUMP_AND_DUMP_ACTIVE   master on/off switch.
+//    true  → PumpAndDumpCoordinator drives a 3-phase scheme on instrument 1
+//            (RELIANCE INDUSTRIES):
+//
+//              Phase 1 — ACCUMULATION (90 s)
+//                Manipulators 2500/2600/2700/2800 gradually accumulate large
+//                positions by placing large BUY LIMIT orders at a mild premium
+//                above the current ask.  Specific retail IDs (4301, 5200, …)
+//                place complementary SELL orders to provide natural supply.
+//                Price rises slowly.
+//
+//              Phase 2 — PUMP (60 s)
+//                Manipulators switch to aggressive BUY orders (2.5–4 % above
+//                market) at higher quantities, rapidly pushing the price up.
+//                Retail FOMO buyers (same ID pool) see the rising price and
+//                join the rally with BUY orders, amplifying the move.
+//
+//              Phase 3 — DUMP (60 s)
+//                Manipulators unload all holdings by placing large SELL LIMIT
+//                orders just below the current bid.  Retail participants (still
+//                expecting further gains) absorb the dump with BUY orders.
+//                Price collapses immediately after the sell-off.
+//
+//    false → coordinator never starts; all four IDs behave as normal retail.
+//
+//  IMPORTANT DESIGN CONSTRAINTS (enforced automatically by phase logic):
+//    • Accumulation + Pump: manipulators BUY only  → same-side, no inter-manip match
+//    • Dump:                manipulators SELL only  → same-side, no inter-manip match
+//    • Manipulators NEVER trade with each other in any phase.
+//    • All other retail MockTrader threads (IDs 0–299) continue trading normally.
+//
+//  ML-detectable signals in QuestDB trade_logs:
+//    ✦ ACCUMULATION: buyer_user_id ∈ {2500,2600,2700,2800}; seller = retail
+//    ✦ PUMP: same buyer IDs + retail FOMO buyers; price climbs visibly
+//    ✦ DUMP: seller_user_id ∈ {2500,2600,2700,2800}; buyer = retail; price crashes
+//    ✦ Volume concentration in 4 IDs over accumulation/pump, then sudden exit
+//    ✦ Sharp price spike followed by immediate collapse — classic P&D signature
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool PUMP_AND_DUMP_ACTIVE = true;
+
+// ── Phase timing (milliseconds) ───────────────────────────────────────────────
+static constexpr int PD_WARMUP_MS          = 15000; // 15 s market warm-up before scheme starts
+static constexpr int PD_ACCUM_DURATION_MS  = 90000; // 90 s accumulation phase
+static constexpr int PD_PUMP_DURATION_MS   = 60000; // 60 s aggressive pump phase
+static constexpr int PD_DUMP_DURATION_MS   = 60000; // 60 s mass dump phase
+
+// ── Order placement intervals ─────────────────────────────────────────────────
+static constexpr int PD_ACCUM_INTERVAL_MS      = 7000; // gap between accumulation bursts
+static constexpr int PD_PUMP_INTERVAL_MS       = 2500; // gap between pump bursts
+static constexpr int PD_DUMP_INTERVAL_MS       = 1500; // gap between dump orders
+static constexpr int PD_MANIP_STAGGER_MS       = 1200; // stagger between each manipulator in a burst
+static constexpr int PD_RETAIL_FOMO_INTERVAL_MS= 4500; // retail FOMO order frequency
+
+// ── Order quantities (shares per manipulator per order) ───────────────────────
+static constexpr size_t PD_ACCUM_QTY_MIN  = 30000;
+static constexpr size_t PD_ACCUM_QTY_MAX  = 60000;
+static constexpr size_t PD_PUMP_QTY_MIN   = 50000;
+static constexpr size_t PD_PUMP_QTY_MAX   = 80000;
+static constexpr size_t PD_DUMP_QTY_MIN   = 90000;
+static constexpr size_t PD_DUMP_QTY_MAX   = 130000;
+
+// ── Retail participant quantities (shares per order) ──────────────────────────
+static constexpr size_t PD_RETAIL_QTY_MIN = 3000;
+static constexpr size_t PD_RETAIL_QTY_MAX = 8000;
+
+// ── Price aggressiveness multipliers ─────────────────────────────────────────
+//  BUY premium:  place above best ask so the order matches immediately and
+//                consumes the ask side, pushing price upward.
+//  SELL discount: place below best bid so the order matches immediately against
+//                retail BUY resting orders during the dump.
+static constexpr double PD_ACCUM_PRICE_PREMIUM = 1.008; // 0.8 % above market
+static constexpr double PD_PUMP_PRICE_PREMIUM  = 1.025; // 2.5 % above market
+static constexpr double PD_DUMP_PRICE_DISCOUNT = 0.997; // 0.3 % below market
+
+// ── Manipulator IDs ───────────────────────────────────────────────────────────
+//  All four buy in phases 1–2 and sell in phase 3 → never opposite sides
+//  in the same phase → can never match each other. ✓
+static const int PD_MANIP_IDS[4] = {2500, 2600, 2700, 2800};
+
+// ── Retail participant IDs visible in trade_logs ──────────────────────────────
+//  ACCUMULATION: these IDs place SELL orders (providing supply to manipulators).
+//  PUMP / DUMP:  these IDs place BUY orders  (FOMO / catching-the-falling-knife).
+static const int PD_RETAIL_FOMO_IDS[] = {
+    4301, 5200, 6102, 4802, 5100,
+    5401, 5500, 5600, 5700, 4701,
+    5900, 4201, 6003, 7102, 8045
+};
+static constexpr int PD_RETAIL_FOMO_COUNT = 15;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PumpAndDumpCoordinator
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Singleton coordinator that manages two threads:
+//    coordThread_  — drives the 3-phase manipulation sequence for the 4 manip IDs.
+//    retailThread_ — simulates retail participants reacting to each phase:
+//                    • ACCUMULATION: retail SELLS into the manipulator BUYs.
+//                    • PUMP / DUMP:  retail BUYS (FOMO / knife-catching).
+//
+//  TradingApplication::start() must call:
+//    PumpAndDumpCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+//    PumpAndDumpCoordinator::instance().start();
+//  TradingApplication cleanup must call:
+//    PumpAndDumpCoordinator::instance().stop();
+// ─────────────────────────────────────────────────────────────────────────────
+class PumpAndDumpCoordinator {
+public:
+    enum class Phase { WARMUP, ACCUMULATION, PUMP, DUMP, DONE };
+
+    static PumpAndDumpCoordinator& instance() {
+        static PumpAndDumpCoordinator inst;
+        return inst;
+    }
+
+    // Must be called BEFORE start().  Supplies the shared order book and logger.
+    void init(std::shared_ptr<OrderBook> ob, Logger* log, int instrId) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        orderBook_ = ob;
+        logger_    = log;
+        instrId_   = instrId;
+    }
+
+    void start() {
+        if (!PUMP_AND_DUMP_ACTIVE) return;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!orderBook_) return; // init() was not called
+            running_ = true;
+            phase_   = Phase::WARMUP;
+        }
+        coordThread_  = std::thread(&PumpAndDumpCoordinator::coordinatorLoop, this);
+        retailThread_ = std::thread(&PumpAndDumpCoordinator::retailFOMOLoop,  this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            running_ = false;
+        }
+        cv_.notify_all();
+        if (coordThread_.joinable())  coordThread_.join();
+        if (retailThread_.joinable()) retailThread_.join();
+    }
+
+private:
+    // ── Read current market price (weak consistency — same pattern as rest of engine) ──
+    double marketPrice() const {
+        const Instrument* instr =
+            InstrumentManager::getInstance().getInstrumentById(instrId_);
+        return instr ? instr->marketPrice : 100.0;
+    }
+
+    // ── Interruptible sleep — returns true if still running, false on shutdown ──
+    bool sleepMs(int ms) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // wait_for returns true when predicate fires (shutdown), false on timeout
+        bool shutdown = cv_.wait_for(lk,
+                                     std::chrono::milliseconds(ms),
+                                     [&] { return !running_; });
+        return !shutdown; // true = still running, false = shutting down
+    }
+
+    // ── Place a LIMIT order on behalf of any participant ──────────────────────
+    void placeOrder(const std::string& userId,
+                    OrderSide          side,
+                    double             price,
+                    size_t             qty) {
+        if (!orderBook_ || price <= 0.0 || qty == 0) return;
+        price = std::round(price * 100.0) / 100.0; // 2 decimal places
+        auto order = std::make_shared<Order>(
+            OrderType::LIMIT, side, price, qty,
+            TimeInForce::GTC, userId, instrId_);
+        orderBook_->addOrder(order);
+        if (logger_) logger_->logOrder(*order);
+    }
+
+    // ── Transition to a new phase and wake the retail thread ─────────────────
+    void setPhase(Phase p) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            phase_ = p;
+        }
+        cv_.notify_all(); // wake retailFOMOLoop and any sleeping sleepMs
+    }
+
+    // ── Coordinator thread: drives the 3-phase pump-and-dump cycle ───────────
+    void coordinatorLoop() {
+        std::mt19937 eng(std::random_device{}());
+        std::uniform_int_distribution<size_t> accumQty(PD_ACCUM_QTY_MIN, PD_ACCUM_QTY_MAX);
+        std::uniform_int_distribution<size_t> pumpQty (PD_PUMP_QTY_MIN,  PD_PUMP_QTY_MAX);
+        std::uniform_int_distribution<size_t> dumpQty (PD_DUMP_QTY_MIN,  PD_DUMP_QTY_MAX);
+
+        // ── Warm-up: let retail order flow establish a natural bid/ask spread ─
+        if (!sleepMs(PD_WARMUP_MS)) return;
+
+        // ══════════════════════════════════════════════════════════════════════
+        //  PHASE 1 — ACCUMULATION
+        //  Manipulators BUY gradually at a mild premium.
+        //  Retail FOMO sellers (from retailFOMOLoop) provide natural supply.
+        //  Price rises slowly as the ask side of the book is consumed.
+        // ══════════════════════════════════════════════════════════════════════
+        setPhase(Phase::ACCUMULATION);
+        auto phaseEnd = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(PD_ACCUM_DURATION_MS);
+
+        while (running_) {
+            if (std::chrono::steady_clock::now() >= phaseEnd) break;
+            double mkt = marketPrice();
+
+            // Each manipulator places one BUY at a slightly escalating premium
+            // so that together they sweep the available sell-side of the book.
+            for (int i = 0; i < 4 && running_; ++i) {
+                // 0.8%, 1.0%, 1.2%, 1.4% above market for IDs 2500→2800
+                double premium = PD_ACCUM_PRICE_PREMIUM + i * 0.002;
+                double price   = mkt * premium;
+                placeOrder(std::to_string(PD_MANIP_IDS[i]),
+                           OrderSide::BUY, price, accumQty(eng));
+                if (!sleepMs(PD_MANIP_STAGGER_MS)) return; // stagger within burst
+            }
+            if (!sleepMs(PD_ACCUM_INTERVAL_MS)) return; // gap between bursts
+        }
+        if (!running_) return;
+
+        // ══════════════════════════════════════════════════════════════════════
+        //  PHASE 2 — PUMP
+        //  Manipulators buy aggressively at a large premium (2.5–4 %).
+        //  Retail FOMO buyers now join the rally (via retailFOMOLoop).
+        //  Price climbs sharply to a speculative peak.
+        // ══════════════════════════════════════════════════════════════════════
+        setPhase(Phase::PUMP);
+        phaseEnd = std::chrono::steady_clock::now()
+                   + std::chrono::milliseconds(PD_PUMP_DURATION_MS);
+
+        while (running_) {
+            if (std::chrono::steady_clock::now() >= phaseEnd) break;
+            double mkt = marketPrice();
+
+            // Aggressive BUY orders: 2.5%, 3.0%, 3.5%, 4.0% above market
+            for (int i = 0; i < 4 && running_; ++i) {
+                double premium = PD_PUMP_PRICE_PREMIUM + i * 0.005;
+                double price   = mkt * premium;
+                placeOrder(std::to_string(PD_MANIP_IDS[i]),
+                           OrderSide::BUY, price, pumpQty(eng));
+                if (!sleepMs(800)) return;
+            }
+            if (!sleepMs(PD_PUMP_INTERVAL_MS)) return;
+        }
+        if (!running_) return;
+
+        // ══════════════════════════════════════════════════════════════════════
+        //  PHASE 3 — DUMP
+        //  Manipulators SELL all holdings at the inflated peak price.
+        //  Large SELL orders hit the book just below the bid, immediately
+        //  matching against retail BUY orders (FOMO / knife-catchers).
+        //  After the dump the ask side floods with supply → price collapses.
+        // ══════════════════════════════════════════════════════════════════════
+        setPhase(Phase::DUMP);
+        phaseEnd = std::chrono::steady_clock::now()
+                   + std::chrono::milliseconds(PD_DUMP_DURATION_MS);
+
+        while (running_) {
+            if (std::chrono::steady_clock::now() >= phaseEnd) break;
+            double mkt = marketPrice();
+
+            // SELL just below bid: 0.3%, 0.4%, 0.5%, 0.6% below market
+            for (int i = 0; i < 4 && running_; ++i) {
+                double discount = PD_DUMP_PRICE_DISCOUNT - i * 0.001;
+                double price    = mkt * discount;
+                placeOrder(std::to_string(PD_MANIP_IDS[i]),
+                           OrderSide::SELL, price, dumpQty(eng));
+                if (!sleepMs(500)) return;
+            }
+            if (!sleepMs(PD_DUMP_INTERVAL_MS)) return;
+        }
+
+        setPhase(Phase::DONE);
+    }
+
+    // ── Retail FOMO thread: simulates retail participant behaviour per phase ───
+    //   ACCUMULATION → retail IDs SELL  (supplying shares to accumulating manips)
+    //   PUMP         → retail IDs BUY   (FOMO chase — attracted by rising price)
+    //   DUMP         → retail IDs BUY   (catching the falling knife)
+    void retailFOMOLoop() {
+        std::mt19937 eng(std::random_device{}());
+        std::uniform_int_distribution<size_t> qtyDist(PD_RETAIL_QTY_MIN, PD_RETAIL_QTY_MAX);
+        std::uniform_int_distribution<int>    idxDist(0, PD_RETAIL_FOMO_COUNT - 1);
+        // Retail SELL: slight below-market discount (natural willing seller)
+        std::uniform_real_distribution<double> sellDiscDist(0.993, 0.999);
+        // Retail BUY: slight above-market premium (eager FOMO buyer / knife-catcher)
+        std::uniform_real_distribution<double> buyPremDist(1.001, 1.010);
+
+        // Block until accumulation phase begins (skip the warm-up period)
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [&] {
+                return !running_
+                    || phase_ == Phase::ACCUMULATION
+                    || phase_ == Phase::PUMP
+                    || phase_ == Phase::DUMP;
+            });
+        }
+        if (!running_) return;
+
+        // Active across ACCUMULATION, PUMP, and DUMP
+        while (running_) {
+            Phase currentPhase;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                currentPhase = phase_;
+            }
+            if (currentPhase == Phase::DONE || currentPhase == Phase::WARMUP) break;
+
+            double mkt = marketPrice();
+            int    rid = PD_RETAIL_FOMO_IDS[idxDist(eng)];
+            size_t qty = qtyDist(eng);
+
+            if (currentPhase == Phase::ACCUMULATION) {
+                // ── Retail trader voluntarily SELLS into accumulating demand ──
+                //    These orders appear as seller_user_id in TRADE_MATCH rows
+                //    where buyer_user_id ∈ {2500,2600,2700,2800}.
+                double price = mkt * sellDiscDist(eng);
+                placeOrder(std::to_string(rid), OrderSide::SELL, price, qty);
+            } else {
+                // ── PUMP / DUMP: retail FOMO BUY ─────────────────────────────
+                //    During PUMP:  matches other retail SELLs  → retail buys from retail
+                //    During DUMP:  matches manipulator SELLs   → buyer=retail, seller=manip
+                //    These are the "knife-catchers" that absorb the dump.
+                double price = mkt * buyPremDist(eng);
+                placeOrder(std::to_string(rid), OrderSide::BUY, price, qty);
+            }
+
+            if (!sleepMs(PD_RETAIL_FOMO_INTERVAL_MS)) return;
+        }
+    }
+
+    // ── Singleton boilerplate ─────────────────────────────────────────────────
+    PumpAndDumpCoordinator()  = default;
+    ~PumpAndDumpCoordinator() { stop(); }
+    PumpAndDumpCoordinator(const PumpAndDumpCoordinator&)            = delete;
+    PumpAndDumpCoordinator& operator=(const PumpAndDumpCoordinator&) = delete;
+
+    // ── Members ───────────────────────────────────────────────────────────────
+    std::shared_ptr<OrderBook> orderBook_;
+    Logger*                    logger_   = nullptr;
+    int                        instrId_  = 1;
+    bool                       running_  = false;
+    Phase                      phase_    = Phase::WARMUP;
+    mutable std::mutex         mtx_;
+    std::condition_variable    cv_;
+    std::thread                coordThread_;
+    std::thread                retailThread_;
+};
+
 
 class MockTrader {
 public:

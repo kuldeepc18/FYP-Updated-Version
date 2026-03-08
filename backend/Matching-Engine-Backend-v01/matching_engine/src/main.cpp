@@ -261,6 +261,13 @@ public:
             }
         }
 
+        // ── Initialize & start Pump-and-Dump coordinator (instrument 1 = RELIANCE) ─
+        // The coordinator drives a 3-phase manipulation scheme entirely in a
+        // background thread: warm-up → accumulation → pump → dump.  It is a
+        // no-op when PUMP_AND_DUMP_ACTIVE == false.
+        PumpAndDumpCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+        PumpAndDumpCoordinator::instance().start();
+
         // Main trading loop
         running_ = true;
         while (running_ && !g_shutdown.load()) {
@@ -311,6 +318,10 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         running_ = false;
+
+        // Stop Pump-and-Dump coordinator before stopping mock traders so that
+        // no further manipulation orders are placed during the drain-down.
+        PumpAndDumpCoordinator::instance().stop();
 
         // Stop all mock traders
         for (auto& trader : mockTraders_)
