@@ -22,6 +22,17 @@ public:
         return orders_.empty() ? nullptr : orders_.front();
     }
 
+    // Return the first resting order whose trader ID differs from the
+    // incoming order's trader ID.  Used by OrderBook::matchOrder() to
+    // enforce self-trade prevention (STP).
+    std::shared_ptr<Order> getFirstOrderExcluding(const std::string& traderId) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& o : orders_) {
+            if (o->getTraderId() != traderId) return o;
+        }
+        return nullptr; // all resting orders belong to the same trader
+    }
+
     void removeOrder(const std::string& orderId) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = std::find_if(orders_.begin(), orders_.end(),

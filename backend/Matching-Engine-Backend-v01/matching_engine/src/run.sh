@@ -75,6 +75,7 @@ elif [ main.cpp -nt matching_engine ] || \
      [ ../include/Logger.hpp -nt matching_engine ] || \
      [ ../include/Instrument.hpp -nt matching_engine ] || \
      [ ../include/MarketDisplay.hpp -nt matching_engine ] || \
+     [ ../include/MockTrader.hpp -nt matching_engine ] || \
      [ ../include/PriceLevel.hpp -nt matching_engine ] || \
      [ ../include/Trade.hpp -nt matching_engine ]; then
     NEEDS_BUILD=1

@@ -106,8 +106,13 @@ private:
                               oppositeSide.begin()->second : oppositeSide.rbegin()->second;
 
             while (!priceLevel->isEmpty() && incomingOrder->getRemainingQuantity() > 0) {
-                auto restingOrder = priceLevel->getFirstOrder();
-                if (!restingOrder) break; // defensive: price level should not yield null while !isEmpty()
+                // ── Self-trade prevention (STP) ──────────────────────────────
+                // Skip any resting order whose traderId matches the incoming
+                // order.  This guarantees buyer_user_id != seller_user_id on
+                // every executed trade.
+                auto restingOrder = priceLevel->getFirstOrderExcluding(
+                    incomingOrder->getTraderId());
+                if (!restingOrder) break; // only same-trader orders remain at this level
                 auto matchQty = std::min(incomingOrder->getRemainingQuantity(),
                                          restingOrder->getRemainingQuantity());
                 executeTrade(incomingOrder, restingOrder, matchQty, bestPrice);
@@ -115,6 +120,12 @@ private:
                 if (incomingOrder->getRemainingQuantity() == 0) { isFullyMatched = true; break; }
             }
 
+            // If the price level still has orders but they all belong to the
+            // same trader as the incoming order (STP), skip to the next level.
+            if (!priceLevel->isEmpty() &&
+                !priceLevel->getFirstOrderExcluding(incomingOrder->getTraderId())) {
+                break; // no matchable counterparties remain at any price
+            }
             if (priceLevel->isEmpty()) oppositeSide.erase(bestPrice);
         }
 

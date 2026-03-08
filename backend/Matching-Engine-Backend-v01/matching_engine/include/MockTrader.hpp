@@ -84,6 +84,292 @@ static constexpr double CIRCULAR_PRICE_JITTER    = 0.002; // ±0.2 % price noise
 // Ring member IDs — defines the directed cycle 2500 → 2600 → 2700 → 2800 → 2500
 static const int CIRCULAR_RING_IDS[4] = {2500, 2600, 2700, 2800};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — MOMENTUM IGNITION  (trader ID 2500)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  MOMENTUM_IGNITION_ACTIVE  master on/off switch.
+//    true  → trader #2500 executes a 3-phase momentum ignition manipulation:
+//            Phase 1 (Momentum Creation): aggressive large BUY orders to push
+//            the price up and accumulate ~80k-120k shares.
+//            Phase 2 (Momentum Reaction): manipulator STOPS buying, holds
+//            position while retail traders react to the rising price.
+//            Phase 3 (Manipulator Exit): once price rises +3% from initial
+//            momentum price OR 5 retail buy trades occur, trader 2500 sells
+//            the entire accumulated position aggressively.
+//    false → trader #2500 behaves as controlled by WASH_TRADER_ACTIVE or
+//            as a normal retail trader.
+//
+//  ML-detectable red flags in QuestDB trade_logs:
+//    ✦ Large, sequential BUY orders from a single user (2500) pushing price up
+//    ✦ Sudden halt in buying followed by retail-only trades
+//    ✦ Large, sequential SELL orders from the SAME user (2500) at elevated prices
+//    ✦ Significant position build-up then rapid unwind
+//    ✦ Price spike correlated with manipulator's buy phase then reversal
+//    ✦ Asymmetric order sizes (manipulator >> retail)
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   MOMENTUM_IGNITION_ACTIVE    = true;  // ← true → momentum ignition enabled
+static constexpr int    MOMENTUM_IGNITION_USER_ID   = 2500;
+
+// ── Momentum Ignition parameters ──────────────────────────────────────────────
+//  Phase 1: Accumulation (BUY phase)
+static constexpr size_t MI_BUY_QUANTITY_MIN    = 15000;  // min shares per buy order
+static constexpr size_t MI_BUY_QUANTITY_MAX    = 30000;  // max shares per buy order
+static constexpr int    MI_BUY_ORDERS          = 5;      // number of buy orders in phase 1
+static constexpr double MI_PRICE_STEP          = 1.0;    // price increment per buy order (₹)
+static constexpr int    MI_BUY_INTERVAL_MS     = 800;    // ms between buy orders
+
+//  Phase 2: Hold / wait for retail reaction
+static constexpr double MI_EXIT_PRICE_PCT      = 0.03;   // +3% price rise triggers sell
+static constexpr int    MI_EXIT_RETAIL_TRADES   = 5;      // OR 5 retail buy trades triggers sell
+static constexpr int    MI_HOLD_CHECK_MS        = 500;    // polling interval during hold phase
+static constexpr int    MI_HOLD_MAX_SECONDS     = 30;     // hard timeout to force sell phase
+
+//  Phase 3: Exit (SELL phase)
+static constexpr int    MI_SELL_ORDERS          = 4;      // number of sell orders in phase 3
+static constexpr int    MI_SELL_INTERVAL_MS     = 600;    // ms between sell orders
+static constexpr double MI_SELL_PRICE_OFFSET    = -0.5;   // sell slightly below best ask to fill fast
+
+//  Repetition: how long to wait before starting the next manipulation cycle
+static constexpr int    MI_CYCLE_PAUSE_MS       = 15000;  // ms pause between full MI cycles
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MomentumIgnitionCoordinator
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Singleton that manages a single dedicated thread for trader 2500.
+//  Implements a strict 3-phase state machine:
+//    PHASE_1_BUY  → PHASE_2_HOLD → PHASE_3_SELL → (pause) → repeat
+//
+//  TradingApplication::start() calls:
+//    MomentumIgnitionCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+//    MomentumIgnitionCoordinator::instance().start();
+//  TradingApplication cleanup calls:
+//    MomentumIgnitionCoordinator::instance().stop();
+// ─────────────────────────────────────────────────────────────────────────────
+class MomentumIgnitionCoordinator {
+public:
+    enum class Phase { PHASE_1_BUY, PHASE_2_HOLD, PHASE_3_SELL, PAUSED };
+
+    static MomentumIgnitionCoordinator& instance() {
+        static MomentumIgnitionCoordinator inst;
+        return inst;
+    }
+
+    void init(std::shared_ptr<OrderBook> ob, Logger* log, int instrId) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        orderBook_ = ob;
+        logger_    = log;
+        instrId_   = instrId;
+    }
+
+    void start() {
+        if (!MOMENTUM_IGNITION_ACTIVE) return;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!orderBook_) return;
+            running_ = true;
+        }
+        thread_ = std::thread(&MomentumIgnitionCoordinator::manipulatorLoop, this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            running_ = false;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void manipulatorLoop() {
+        std::mt19937 eng(std::random_device{}());
+        const std::string traderId = std::to_string(MOMENTUM_IGNITION_USER_ID);
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (!running_) break;
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            //  PHASE 1 — MOMENTUM CREATION (BUY PHASE)
+            //  Aggressively buy shares from retail traders to push price up.
+            //  Uses limit orders priced ABOVE the best ask to sweep retail
+            //  sell orders sitting in the book, guaranteeing matches against
+            //  retail sellers (never self-trades — enforced by OrderBook STP).
+            //  Accumulate ~80,000–120,000 shares across multiple large orders.
+            // ══════════════════════════════════════════════════════════════════
+            const Instrument* instr =
+                InstrumentManager::getInstance().getInstrumentById(instrId_);
+            double initialPrice = instr ? instr->marketPrice : 100.0;
+            size_t accumulatedPosition = 0;
+
+            std::uniform_int_distribution<size_t> qtyDist(MI_BUY_QUANTITY_MIN, MI_BUY_QUANTITY_MAX);
+
+            for (int i = 0; i < MI_BUY_ORDERS; ++i) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) return;
+                }
+
+                // Price aggressively above best ask to sweep retail sellers
+                double bestAsk = orderBook_->getBestAskPrice();
+                instr = InstrumentManager::getInstance().getInstrumentById(instrId_);
+                double mktPrice = instr ? instr->marketPrice : initialPrice;
+                // Use whichever is higher: best ask or market price, then step above
+                double baseRef = (bestAsk > 0.0) ? bestAsk : mktPrice;
+                double buyPrice = baseRef + MI_PRICE_STEP * (i + 1);
+                buyPrice = std::round(buyPrice * 100.0) / 100.0;
+
+                size_t qty = qtyDist(eng);
+                accumulatedPosition += qty;
+
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, OrderSide::BUY,
+                    buyPrice, qty,
+                    TimeInForce::GTC, traderId, instrId_);
+                orderBook_->addOrder(order);
+                if (logger_) logger_->logOrder(*order);
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(MI_BUY_INTERVAL_MS));
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            //  PHASE 2 — MOMENTUM REACTION (HOLD PHASE)
+            //  Trader 2500 STOPS buying. Holds position.
+            //  Wait until either:
+            //    (a) price rises +3% above initialPrice, OR
+            //    (b) 5 retail buy trades are observed, OR
+            //    (c) hard timeout (MI_HOLD_MAX_SECONDS)
+            // ══════════════════════════════════════════════════════════════════
+            size_t tradesAtPhase2Start = orderBook_->getTotalTradeCount();
+            auto   holdStart = std::chrono::steady_clock::now();
+            bool   exitTriggered = false;
+
+            while (!exitTriggered) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) return;
+                }
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(MI_HOLD_CHECK_MS));
+
+                // Check price condition: +3% above initial momentum price
+                instr = InstrumentManager::getInstance().getInstrumentById(instrId_);
+                double nowPrice = instr ? instr->marketPrice : initialPrice;
+                if (nowPrice >= initialPrice * (1.0 + MI_EXIT_PRICE_PCT)) {
+                    exitTriggered = true;
+                    break;
+                }
+
+                // Check retail trade count condition
+                size_t tradesNow = orderBook_->getTotalTradeCount();
+                if ((tradesNow - tradesAtPhase2Start) >= static_cast<size_t>(MI_EXIT_RETAIL_TRADES)) {
+                    exitTriggered = true;
+                    break;
+                }
+
+                // Hard timeout to guarantee we always reach Phase 3
+                auto elapsed = std::chrono::steady_clock::now() - holdStart;
+                if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
+                    >= MI_HOLD_MAX_SECONDS) {
+                    exitTriggered = true;
+                    break;
+                }
+            }
+
+            // ══════════════════════════════════════════════════════════════════
+            //  PHASE 3 — MANIPULATOR EXIT (SELL PHASE)
+            //  THIS PHASE MUST ALWAYS EXECUTE.
+            //  Trader 2500 sells the entire accumulated position to retail
+            //  buyers.  Uses limit orders priced BELOW the best bid to sweep
+            //  retail buy orders in the book (self-trade prevention in the
+            //  matching engine guarantees only retail counterparties).
+            // ══════════════════════════════════════════════════════════════════
+            size_t remainingToSell = accumulatedPosition;
+            for (int i = 0; i < MI_SELL_ORDERS && remainingToSell > 0; ++i) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) {
+                        // Even on shutdown, MUST dump remaining position
+                        if (remainingToSell > 0) {
+                            double bestBid = orderBook_->getBestBidPrice();
+                            instr = InstrumentManager::getInstance().getInstrumentById(instrId_);
+                            double ref = (bestBid > 0.0) ? bestBid : (instr ? instr->marketPrice : 100.0);
+                            double sellPrice = ref + MI_SELL_PRICE_OFFSET;
+                            sellPrice = std::round(sellPrice * 100.0) / 100.0;
+                            auto exitOrder = std::make_shared<Order>(
+                                OrderType::LIMIT, OrderSide::SELL,
+                                sellPrice, remainingToSell,
+                                TimeInForce::GTC, traderId, instrId_);
+                            orderBook_->addOrder(exitOrder);
+                            if (logger_) logger_->logOrder(*exitOrder);
+                        }
+                        return;
+                    }
+                }
+
+                // Calculate sell quantity for this order
+                size_t sellQty;
+                if (i == MI_SELL_ORDERS - 1) {
+                    // Last order: dump everything remaining
+                    sellQty = remainingToSell;
+                } else {
+                    // Distribute roughly evenly, with some randomness
+                    size_t avgQty = remainingToSell / (MI_SELL_ORDERS - i);
+                    std::uniform_int_distribution<size_t> sellDist(
+                        avgQty * 80 / 100, avgQty * 120 / 100);
+                    sellQty = std::min(sellDist(eng), remainingToSell);
+                }
+
+                // Price below best bid to aggressively sweep retail buyers
+                double bestBid = orderBook_->getBestBidPrice();
+                instr = InstrumentManager::getInstance().getInstrumentById(instrId_);
+                double ref = (bestBid > 0.0) ? bestBid : (instr ? instr->marketPrice : 100.0);
+                double sellPrice = ref + MI_SELL_PRICE_OFFSET;
+                sellPrice = std::round(sellPrice * 100.0) / 100.0;
+
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, OrderSide::SELL,
+                    sellPrice, sellQty,
+                    TimeInForce::GTC, traderId, instrId_);
+                orderBook_->addOrder(order);
+                if (logger_) logger_->logOrder(*order);
+
+                remainingToSell -= sellQty;
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(MI_SELL_INTERVAL_MS));
+            }
+
+            // ── Cycle pause before repeating ──────────────────────────────────
+            for (int ms = 0; ms < MI_CYCLE_PAUSE_MS; ms += 500) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (!running_) return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    std::min(500, MI_CYCLE_PAUSE_MS - ms)));
+            }
+        } // while(true) — next MI cycle
+    }
+
+    // ── Private constructor / copy-delete (singleton) ─────────────────────────
+    MomentumIgnitionCoordinator()  = default;
+    ~MomentumIgnitionCoordinator() { stop(); }
+    MomentumIgnitionCoordinator(const MomentumIgnitionCoordinator&) = delete;
+    MomentumIgnitionCoordinator& operator=(const MomentumIgnitionCoordinator&) = delete;
+
+    // ── Members ───────────────────────────────────────────────────────────────
+    std::shared_ptr<OrderBook>  orderBook_;
+    Logger*                     logger_    = nullptr;
+    int                         instrId_   = 1;
+    bool                        running_   = false;
+    std::mutex                  mtx_;
+    std::thread                 thread_;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +561,13 @@ public:
         // Flip WASH_TRADER_ACTIVE to false to revert #2500 to retail behaviour.
         isWashTrader_ = (WASH_TRADER_ACTIVE && myId == WASH_TRADER_USER_ID);
 
+        // ── Designate trader #2500 as the momentum ignition manipulator ──────
+        // When MOMENTUM_IGNITION_ACTIVE is true, trader 2500's trading is
+        // handled entirely by MomentumIgnitionCoordinator (separate thread).
+        // The MockTrader thread for 2500 runs as idle (no orders) so it does
+        // NOT perform wash trading, spoofing, or any other manipulation.
+        isMomentumIgnitionTrader_ = (MOMENTUM_IGNITION_ACTIVE && myId == MOMENTUM_IGNITION_USER_ID);
+
         // ── Note: traders 2500 / 2600 / 2700 / 2800 additionally participate
         // in the circular trading ring via CircularRingCoordinator (separate
         // threads).  Their MockTrader thread continues its primary behaviour
@@ -393,6 +686,14 @@ private:
 
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
+        // If momentum ignition is active for this trader, its trading is managed
+        // by MomentumIgnitionCoordinator. This thread simply idles.
+        if (isMomentumIgnitionTrader_) {
+            while (running_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            return;
+        }
         if (isWashTrader_)
             runWash();
         else
@@ -403,6 +704,7 @@ private:
     std::shared_ptr<OrderBook> orderBook_;
     std::string                traderId_;
     bool                       isWashTrader_ = false;
+    bool                       isMomentumIgnitionTrader_ = false;
     std::atomic<bool>          running_;
     std::thread                thread_;
 
