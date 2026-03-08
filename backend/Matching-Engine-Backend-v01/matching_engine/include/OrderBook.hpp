@@ -108,6 +108,17 @@ private:
             while (!priceLevel->isEmpty() && incomingOrder->getRemainingQuantity() > 0) {
                 auto restingOrder = priceLevel->getFirstOrder();
                 if (!restingOrder) break; // defensive: price level should not yield null while !isEmpty()
+
+                // ── Self-trade prevention: buyer_user_id must never equal seller_user_id ──
+                // If both sides belong to the same trader, reject the match by
+                // cancelling the resting order and continuing to the next one.
+                if (incomingOrder->getTraderId() == restingOrder->getTraderId()) {
+                    removeOrderFromBook(restingOrder);
+                    restingOrder->cancel();
+                    if (logger_) logger_->logOrder(*restingOrder);
+                    continue; // skip to next resting order at this price level
+                }
+
                 auto matchQty = std::min(incomingOrder->getRemainingQuantity(),
                                          restingOrder->getRemainingQuantity());
                 executeTrade(incomingOrder, restingOrder, matchQty, bestPrice);

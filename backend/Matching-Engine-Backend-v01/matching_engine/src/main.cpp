@@ -251,12 +251,19 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (20 per instrument) to generate live order flow ──
-        for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
-            auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 20; ++i) {
+        // ── Start 10,000 mock traders distributed round-robin across instruments ──
+        // Trader IDs 0-9999.  Trader 2500 is the ramping manipulator.
+        // All remaining 9,999 traders behave as normal retail participants.
+        {
+            const auto& instruments = InstrumentManager::getInstance().getInstruments();
+            int numInstruments = static_cast<int>(instruments.size());
+            int totalMockTraders = 10000;
+            for (int t = 0; t < totalMockTraders; ++t) {
+                int instrIdx = t % numInstruments;
+                int instrId  = instruments[instrIdx].instrumentId;
+                auto ob = orderBooks_[instrId];
                 mockTraders_.emplace_back(
-                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
+                    std::make_unique<MockTrader>(ob, instrId, &logger_));
                 mockTraders_.back()->start();
             }
         }

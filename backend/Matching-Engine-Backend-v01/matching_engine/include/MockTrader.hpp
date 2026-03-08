@@ -84,6 +84,39 @@ static constexpr double CIRCULAR_PRICE_JITTER    = 0.002; // ±0.2 % price noise
 // Ring member IDs — defines the directed cycle 2500 → 2600 → 2700 → 2800 → 2500
 static const int CIRCULAR_RING_IDS[4] = {2500, 2600, 2700, 2800};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION — RAMPING  (trader ID 2500)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  RAMPING_ACTIVE   master on/off switch.
+//    true  → trader #2500 repeatedly places small BUY orders at gradually
+//            increasing prices, pushing the price upward without sudden spikes.
+//            Retail traders act as natural sellers on the opposite side.
+//    false → trader #2500 reverts to a normal retail trader.
+//
+//  RAMPING_TRADER_USER_ID  the trader ID performing the ramp.
+//
+//  How ramping works:
+//    Step 0 : 2500 BUY 1,000 @ marketPrice + 0.20
+//    Step 1 : 2500 BUY 1,000 @ marketPrice + 0.40
+//    Step 2 : 2500 BUY 1,000 @ marketPrice + 0.60
+//    ... continues with RAMPING_PRICE_INCREMENT each step ...
+//
+//  ML-detectable red flags in QuestDB trade_logs:
+//    * Single user_id (2500) on the BUY side of many consecutive trades
+//    * Monotonically increasing trade prices over a short time window
+//    * No SELL orders from user 2500 during ramp phase
+//    * Consistent small quantity on every order (RAMPING_QUANTITY = 1,000)
+//    * Periodic timing signature (order every RAMPING_INTERVAL_MS)
+//    * Gradual price uptrend driven by a single participant
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   RAMPING_ACTIVE            = true;   // true = trader 2500 ramps
+static constexpr int    RAMPING_TRADER_USER_ID    = 2500;
+static constexpr size_t RAMPING_QUANTITY           = 1000;   // shares per buy order
+static constexpr double RAMPING_PRICE_INCREMENT    = 0.20;   // price increase per step
+static constexpr int    RAMPING_INTERVAL_MS        = 1500;   // ms between consecutive buy orders
+static constexpr int    RAMPING_STEPS_PER_CYCLE    = 20;     // buy orders per cycle
+static constexpr int    RAMPING_PAUSE_MS           = 3000;   // ms pause between cycles
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +308,12 @@ public:
         // Flip WASH_TRADER_ACTIVE to false to revert #2500 to retail behaviour.
         isWashTrader_ = (WASH_TRADER_ACTIVE && myId == WASH_TRADER_USER_ID);
 
+        // ── Designate trader #2500 as the ramping manipulator ────────────────
+        // When RAMPING_ACTIVE == true, trader 2500 ONLY places BUY orders at
+        // gradually increasing prices.  All other manipulation flags for 2500
+        // must be false (no wash, no spoofing, no layering, etc.).
+        isRampingTrader_ = (RAMPING_ACTIVE && myId == RAMPING_TRADER_USER_ID);
+
         // ── Note: traders 2500 / 2600 / 2700 / 2800 additionally participate
         // in the circular trading ring via CircularRingCoordinator (separate
         // threads).  Their MockTrader thread continues its primary behaviour
@@ -391,9 +430,59 @@ private:
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    //  RAMPING TRADER  (trader #2500 only, when RAMPING_ACTIVE == true)
+    //
+    //  What ramping looks like in QuestDB trade_logs:
+    //
+    //    buyer_user_id | seller_user_id |  price   |  qty
+    //    --------------+----------------+----------+------
+    //      2500        |  4511          |  100.00  | 1000
+    //      2500        |  4722          |  100.20  | 1000
+    //      2500        |  4981          |  100.40  | 1000
+    //      2500        |  5102          |  100.60  | 1000
+    //      2500        |  6230          |  100.80  | 1000
+    //      ...  gradually increasing price, always BUY side  ...
+    //
+    //  Restrictions enforced:
+    //    - Trader 2500 ONLY places BUY orders during ramp phase
+    //    - Trader 2500 does NOT sell during ramp
+    //    - Trades only with retail traders (self-trade prevention in OrderBook)
+    // ──────────────────────────────────────────────────────────────────────────
+    void runRamping() {
+        const Instrument* instr =
+            InstrumentManager::getInstance().getInstrumentById(instrumentId_);
+        double rampPrice = instr ? instr->marketPrice : 100.0;
+
+        while (running_) {
+            for (int step = 0; step < RAMPING_STEPS_PER_CYCLE && running_; ++step) {
+                // Each BUY order slightly increases the price
+                rampPrice += RAMPING_PRICE_INCREMENT;
+                rampPrice = std::round(rampPrice * 100.0) / 100.0; // 2 d.p.
+
+                // Place aggressive BUY order at ramping price
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, OrderSide::BUY,
+                    rampPrice, RAMPING_QUANTITY,
+                    TimeInForce::GTC, traderId_, instrumentId_);
+                orderBook_->addOrder(order);
+                if (logger_) logger_->logOrder(*order);
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(RAMPING_INTERVAL_MS));
+            }
+
+            // Pause between ramping cycles
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(RAMPING_PAUSE_MS));
+        }
+    }
+
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
-        if (isWashTrader_)
+        if (isRampingTrader_)
+            runRamping();
+        else if (isWashTrader_)
             runWash();
         else
             runRetail();
@@ -402,7 +491,8 @@ private:
     // ── Members ───────────────────────────────────────────────────────────────
     std::shared_ptr<OrderBook> orderBook_;
     std::string                traderId_;
-    bool                       isWashTrader_ = false;
+    bool                       isWashTrader_   = false;
+    bool                       isRampingTrader_ = false;
     std::atomic<bool>          running_;
     std::thread                thread_;
 
