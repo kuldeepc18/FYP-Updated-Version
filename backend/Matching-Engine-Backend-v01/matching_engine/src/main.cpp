@@ -251,10 +251,12 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (20 per instrument) to generate live order flow ──
+        // ── Start mock traders (667 per instrument = ~10 005 total) to generate
+        //    live order flow.  Trader ID 2500 is the quote-stuffing manipulator;
+        //    all others are normal retail traders. ───────────────────────────────
         for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
             auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 20; ++i) {
+            for (int i = 0; i < 667; ++i) {
                 mockTraders_.emplace_back(
                     std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
                 mockTraders_.back()->start();

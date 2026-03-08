@@ -29,6 +29,47 @@
 static constexpr bool   WASH_TRADER_ACTIVE   = false;  // ← false → all traders are retail
 static constexpr int    WASH_TRADER_USER_ID  = 2500;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — QUOTE STUFFING  (trader ID 2500)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  QUOTE_STUFFING_ACTIVE  master on/off switch.
+//    true  → trader #2500 floods the order book with thousands of large orders
+//            and cancels them within milliseconds, creating artificial noise
+//            and latency for other participants.
+//    false → trader #2500 reverts to a normal retail trader.
+//
+//  ML-detectable red flags in QuestDB trade_logs:
+//    ✦ Extremely high ORDER_NEW count from a single user_id (2500)
+//    ✦ Near-equal ORDER_CANCELLED count from the same user_id
+//    ✦ Extremely low execution ratio (< 0.25% fills vs submissions)
+//    ✦ Very large order quantities (50 000 – 100 000 shares) vs retail (1-100)
+//    ✦ Sub-millisecond submission intervals (order_submit_timestamp gaps)
+//    ✦ Millisecond-scale cancel latency (cancel_timestamp − submit_timestamp)
+//    ✦ Periodic burst pattern with escalating quantities
+//    ✦ Orders placed 2-5% away from market to avoid matching
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   QUOTE_STUFFING_ACTIVE     = true;   // ← true → trader 2500 is the quote stuffer
+static constexpr int    QUOTE_STUFFER_USER_ID     = 2500;
+
+// ── Quote-stuffing burst parameters ───────────────────────────────────────────
+//  QS_ORDERS_PER_BURST   number of orders submitted per burst
+//  QS_BASE_QUANTITY      starting share quantity per order (escalates each burst)
+//  QS_QUANTITY_RAMP      quantity increase per burst
+//  QS_MAX_QUANTITY       cap on share quantity
+//  QS_CANCEL_DELAY_MS    milliseconds between submission and mass-cancel
+//  QS_CANCEL_RATIO       fraction of orders cancelled (99.7% → ~0.3% might execute)
+//  QS_BURST_PAUSE_MS     idle gap between bursts
+//  QS_PRICE_OFFSET_PCT   how far from market to place orders (avoids matching)
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int    QS_ORDERS_PER_BURST       = 500;     // orders per burst
+static constexpr size_t QS_BASE_QUANTITY          = 50000;   // shares per order (start)
+static constexpr size_t QS_QUANTITY_RAMP          = 10000;   // increase each burst
+static constexpr size_t QS_MAX_QUANTITY           = 100000;  // cap
+static constexpr int    QS_CANCEL_DELAY_MS        = 3;       // ms before mass cancel
+static constexpr double QS_CANCEL_RATIO           = 0.997;   // cancel 99.7%
+static constexpr int    QS_BURST_PAUSE_MS         = 2000;    // ms between bursts
+static constexpr double QS_PRICE_OFFSET_PCT       = 0.03;    // 3% from market
+
 // ── Wash-trade burst parameters ───────────────────────────────────────────────
 //  WASH_QUANTITY     shares placed on each BUY leg AND each SELL leg.
 //  WASH_INTERVAL_MS  ms between the BUY leg and its mirrored SELL leg.
@@ -75,7 +116,7 @@ static constexpr int    WASH_PAUSE_MS      = 4000;  // ms idle between bursts
 //    ✦ Periodic timing signature (~CIRCULAR_STEP_MS × 8 per cycle)
 //    ✦ Sudden, sustained volume spike on instrument 1 (RELIANCE)
 // ═══════════════════════════════════════════════════════════════════════════════
-static constexpr bool   CIRCULAR_TRADING_ACTIVE = false; // ← false → ring disabled, all traders are retail
+static constexpr bool   CIRCULAR_TRADING_ACTIVE = false; // ← false → ring disabled
 static constexpr size_t CIRCULAR_QUANTITY        = 5000;  // shares per ring order
 static constexpr int    CIRCULAR_STEP_MS         = 500;   // ms between ring steps
 static constexpr int    CIRCULAR_PAUSE_MS        = 3000;  // ms pause between full rotations
@@ -265,21 +306,23 @@ public:
         , washPriceJitter_(0.999, 1.001)    // ±0.1 % price noise     (wash)
         , logger_(logger)
     {
-        if (mockTraderCount >= 10000)
-            throw std::runtime_error("Max 10 000 mock traders allowed");
+        if (mockTraderCount >= 10100)
+            throw std::runtime_error("Max mock traders exceeded");
 
         int myId  = mockTraderCount++;
         traderId_ = std::to_string(myId);
 
         // ── Designate trader #2500 as the wash-trade manipulator ─────────────
-        // Flip WASH_TRADER_ACTIVE to false to revert #2500 to retail behaviour.
         isWashTrader_ = (WASH_TRADER_ACTIVE && myId == WASH_TRADER_USER_ID);
+
+        // ── Designate trader #2500 as the quote-stuffing manipulator ─────────
+        isQuoteStuffer_ = (QUOTE_STUFFING_ACTIVE && myId == QUOTE_STUFFER_USER_ID);
 
         // ── Note: traders 2500 / 2600 / 2700 / 2800 additionally participate
         // in the circular trading ring via CircularRingCoordinator (separate
         // threads).  Their MockTrader thread continues its primary behaviour
-        // (wash for 2500, retail for 2600/2700/2800) on their assigned instrument
-        // while the ring coordinator fires ring orders on instrument 1 (RELIANCE).
+        // on their assigned instrument while the ring coordinator fires ring
+        // orders on instrument 1 (RELIANCE).
     }
 
     void start() {
@@ -391,9 +434,102 @@ private:
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    //  QUOTE STUFFER  (trader #2500 only, when QUOTE_STUFFING_ACTIVE == true)
+    //
+    //  What quote stuffing looks like in QuestDB trade_logs:
+    //
+    //    user_id │ order_status_event │   qty   │ time gap
+    //    ────────┼────────────────────┼─────────┼──────────
+    //      2500  │ ORDER_NEW          │  50000  │  <50 µs   ← rapid-fire submissions
+    //      2500  │ ORDER_NEW          │  50000  │  <50 µs
+    //      …     │ … × 500 orders     │         │
+    //      2500  │ ORDER_CANCELLED    │  50000  │  <10 µs   ← mass cancel 3 ms later
+    //      2500  │ ORDER_CANCELLED    │  50000  │  <10 µs
+    //      …     │ … × ~498 cancels   │         │
+    //      ── pause 2 s → next burst with qty = 60000 ──
+    //
+    //  ML red-flag signals baked into every burst:
+    //    ✦ Massive ORDER_NEW / ORDER_CANCELLED ratio from one user_id (2500)
+    //    ✦ Extremely low execution ratio (< 0.3% of orders execute)
+    //    ✦ Very large order quantities (50 000+) vs retail (1-100)
+    //    ✦ Sub-millisecond inter-order submission gaps
+    //    ✦ Cancel latency ≤ 3 ms after submission
+    //    ✦ Escalating quantities across bursts (50k → 60k → 70k …)
+    //    ✦ Periodic burst pattern in time-series (burst → pause → burst)
+    // ──────────────────────────────────────────────────────────────────────────
+    void runQuoteStuffing() {
+        size_t currentQuantity = QS_BASE_QUANTITY;
+
+        while (running_) {
+            const Instrument* instr =
+                InstrumentManager::getInstance().getInstrumentById(instrumentId_);
+            double marketPrice = instr ? instr->marketPrice : 100.0;
+
+            // ── Phase 1: FLOOD — submit orders at extreme speed ──────────────
+            std::vector<std::shared_ptr<Order>> stuffedOrders;
+            stuffedOrders.reserve(QS_ORDERS_PER_BURST);
+
+            for (int i = 0; i < QS_ORDERS_PER_BURST && running_; ++i) {
+                // Alternate BUY / SELL; price offset 3-5% from market so
+                // almost nothing matches (quote-stuff hallmark).
+                OrderSide side = (i % 2 == 0) ? OrderSide::BUY : OrderSide::SELL;
+                double noise = (engine_() % 200) * 0.00001; // 0-0.2% extra jitter
+                double price;
+                if (side == OrderSide::BUY)
+                    price = marketPrice * (1.0 - QS_PRICE_OFFSET_PCT - noise);
+                else
+                    price = marketPrice * (1.0 + QS_PRICE_OFFSET_PCT + noise);
+                price = std::round(price * 100.0) / 100.0;
+
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, side, price, currentQuantity,
+                    TimeInForce::GTC, traderId_, instrumentId_);
+
+                orderBook_->addOrder(order);
+                if (logger_) logger_->logOrder(*order); // ORDER_NEW
+                stuffedOrders.push_back(order);
+
+                // Sub-millisecond gap between submissions (50 µs)
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+
+            // ── Phase 2: CANCEL — yank orders within milliseconds ────────────
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(QS_CANCEL_DELAY_MS));
+
+            int cancelTarget = static_cast<int>(
+                stuffedOrders.size() * QS_CANCEL_RATIO);
+
+            for (int i = 0; i < cancelTarget && running_; ++i) {
+                auto& order = stuffedOrders[i];
+                // Skip orders already matched (FILLED / PARTIALLY_FILLED)
+                if (order->getStatus() == OrderStatus::NEW ||
+                    order->getStatus() == OrderStatus::PARTIALLY_FILLED) {
+                    orderBook_->cancelOrder(order->getOrderId());
+                    // Log the cancellation event to QuestDB
+                    if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
+                        logger_->logOrder(*order);
+                }
+            }
+
+            // ── Ramp up quantity for next burst ──────────────────────────────
+            if (currentQuantity < QS_MAX_QUANTITY)
+                currentQuantity += QS_QUANTITY_RAMP;
+            else
+                currentQuantity = QS_BASE_QUANTITY; // wrap around
+
+            // ── Pause between bursts ─────────────────────────────────────────
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(QS_BURST_PAUSE_MS));
+        }
+    }
+
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
-        if (isWashTrader_)
+        if (isQuoteStuffer_)
+            runQuoteStuffing();
+        else if (isWashTrader_)
             runWash();
         else
             runRetail();
@@ -402,7 +538,8 @@ private:
     // ── Members ───────────────────────────────────────────────────────────────
     std::shared_ptr<OrderBook> orderBook_;
     std::string                traderId_;
-    bool                       isWashTrader_ = false;
+    bool                       isWashTrader_   = false;
+    bool                       isQuoteStuffer_ = false;
     std::atomic<bool>          running_;
     std::thread                thread_;
 
