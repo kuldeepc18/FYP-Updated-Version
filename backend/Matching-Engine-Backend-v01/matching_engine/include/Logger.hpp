@@ -71,6 +71,10 @@
  *  device_id_hash        SYMBOL   8-char hex FNV-1a fingerprint of traderId;
  *                                 simulates device fingerprinting for ML
  *                                 "NA" for TRADE_MATCH rows
+ *  trader_type           SYMBOL   "manipulator" for IDs 2500–2519 (layering
+ *                                 manipulators), "normal" for all other traders.
+ *                                 For TRADE_MATCH rows: "manipulator" if either
+ *                                 buyer or seller is a manipulator ID.
  *
  *  FIELD (typed value) columns — appear after the space in ILP lines:
  *  ─────────────────────────────────────────────────────────────────────────
@@ -150,6 +154,7 @@ public:
         const std::string userId    = sanitizeTag(order.getTraderId());
         const std::string phase     = sanitizeTag(order.getMarketPhase());
         const std::string devHash   = sanitizeTag(order.getDeviceIdHash());
+        const std::string traderType = classifyTraderType(order.getTraderId());
 
         const long long qty          = static_cast<long long>(order.getQuantity());
         const long long filledQty    = static_cast<long long>(
@@ -187,6 +192,7 @@ public:
             << ",aggressor_side=NA"              // NA for non-match order events
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash
+            << ",trader_type="        << traderType
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << order.getPrice()
@@ -226,6 +232,8 @@ public:
         const std::string buyOrderId   = sanitizeTag(trade.getBuyOrderId());
         const std::string buyerUid     = sanitizeTag(trade.getBuyerUserId());
         const std::string sellerUid    = sanitizeTag(trade.getSellerUserId());
+        const std::string traderType   = classifyTradeType(trade.getBuyerUserId(),
+                                                           trade.getSellerUserId());
         const std::string aggrSide     = (trade.getAggressorSide() == OrderSide::BUY)
                                              ? "BUY" : "SELL";
         const std::string phase        = sanitizeTag(marketPhaseFromTp(trade.getTimestamp()));
@@ -259,6 +267,7 @@ public:
             << ",aggressor_side="     << aggrSide
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash  // aggressor's fingerprint — always present
+            << ",trader_type="        << traderType
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << trade.getPrice()
@@ -356,6 +365,31 @@ private:
         if (istMin >= 540 && istMin < 555) return "PRE_OPEN";
         if (istMin >= 555 && istMin < 930) return "OPEN";
         return "CLOSED";
+    }
+
+    // ── Trader-type classification for the trader_type QuestDB column ──────
+    // Manipulator IDs: 2500–2519 (20 layering manipulators).
+    static std::string classifyTraderType(const std::string& userId) {
+        try {
+            int id = std::stoi(userId);
+            if (id >= 2500 && id < 2520) return "manipulator";
+        } catch (...) {}
+        return "normal";
+    }
+
+    // For TRADE_MATCH rows: "manipulator" if either buyer or seller is a
+    // manipulator ID, "normal" otherwise.
+    static std::string classifyTradeType(const std::string& buyerUid,
+                                         const std::string& sellerUid) {
+        try {
+            int bId = std::stoi(buyerUid);
+            if (bId >= 2500 && bId < 2520) return "manipulator";
+        } catch (...) {}
+        try {
+            int sId = std::stoi(sellerUid);
+            if (sId >= 2500 && sId < 2520) return "manipulator";
+        } catch (...) {}
+        return "normal";
     }
 
     // Replace ILP tag-special characters (space, comma, equals) with underscore.

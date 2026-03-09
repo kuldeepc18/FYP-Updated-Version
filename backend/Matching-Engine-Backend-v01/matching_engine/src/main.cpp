@@ -261,8 +261,8 @@ public:
             }
         }
 
-        // ── Start Layering coordinator (trader 2500 on instrument 1 — RELIANCE) ──
-        LayeringCoordinator::instance().init(orderBooks_[1], &logger_, 1);
+        // ── Start Layering coordinator (20 manipulators: IDs 2500–2519) ──
+        LayeringCoordinator::instance().init(orderBooks_, &logger_);
         LayeringCoordinator::instance().start();
 
         // Main trading loop
