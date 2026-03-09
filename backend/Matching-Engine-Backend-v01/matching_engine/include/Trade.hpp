@@ -32,7 +32,9 @@ public:
           const std::string& buyerUserId,
           const std::string& sellerUserId,
           OrderSide          aggressorSide,
-          int                instrumentId)
+          int                instrumentId,
+          const std::string& buyerTraderType  = "normal",
+          const std::string& sellerTraderType = "normal")
         : buyOrderId_(buyOrderId)
         , sellOrderId_(sellOrderId)
         , price_(price)
@@ -43,6 +45,8 @@ public:
         , sellerUserId_(sellerUserId)
         , aggressorSide_(aggressorSide)
         , instrumentId_(instrumentId)
+        , buyerTraderType_(buyerTraderType)
+        , sellerTraderType_(sellerTraderType)
     {}
 
     // ── Original getters (kept for backward compat) ───────────────────────────
@@ -60,6 +64,8 @@ public:
     const std::string& getSellerUserId()  const { return sellerUserId_;  }
     OrderSide          getAggressorSide() const { return aggressorSide_; }
     int                getInstrumentId()  const { return instrumentId_;  }
+    const std::string& getBuyerTraderType()  const { return buyerTraderType_;  }
+    const std::string& getSellerTraderType() const { return sellerTraderType_; }
 
 private:
     // Trade ID format: TRD-<instrumentId>-<10-digit random>
@@ -85,6 +91,8 @@ private:
     std::string sellerUserId_;  // traderId of the sell-side participant
     OrderSide   aggressorSide_; // which side was the incoming (price-taking) order
     int         instrumentId_;  // instrument on which the trade was executed
+    std::string buyerTraderType_;  // "normal" or "manipulator"
+    std::string sellerTraderType_; // "normal" or "manipulator"
 };
 
 #endif // TRADE_HPP

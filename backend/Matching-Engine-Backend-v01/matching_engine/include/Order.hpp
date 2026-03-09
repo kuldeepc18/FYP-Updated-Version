@@ -87,6 +87,10 @@ public:
     // ── Setter (allows callers to flag a sell as a short-sell explicitly) ─────
     void setIsShortSell(bool v) { isShortSell_ = v; }
 
+    // ── Trader type ("normal" or "manipulator") ──────────────────────────────
+    const std::string& getTraderType() const { return traderType_; }
+    void setTraderType(const std::string& t) { traderType_ = t; }
+
     // ── Public utility: deterministic FNV-1a device fingerprint ──────────────
     // Exposed as public static so Logger can compute a hash for the aggressor
     // user on TRADE_MATCH rows without needing an Order object.
@@ -196,6 +200,9 @@ private:
     bool        isShortSell_;   // true if this is a naked/covered short sale
     std::string marketPhase_;   // PRE_OPEN | OPEN | CLOSED  (computed at placement)
     std::string deviceIdHash_;  // 8-char hex FNV-1a fingerprint of traderId
+
+    // ── Trader type field ──────────────────────────────────────────────────────
+    std::string traderType_ = "normal";  // "normal" or "manipulator"
 
     // ── Trade-context fields (set by fillWithTradeContext, default "NA") ──────
     // Populated the moment this order participates in a match so that

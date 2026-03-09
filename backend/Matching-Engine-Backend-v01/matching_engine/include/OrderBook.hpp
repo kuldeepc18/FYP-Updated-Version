@@ -166,11 +166,20 @@ private:
         //    incoming and resting orders carry real IDs (trade_id, buyer_user_id,
         //    seller_user_id) instead of "NA", for every status event row written
         //    to QuestDB (PARTIAL, FILLED, CANCELLED-after-partial, EXPIRED-after-partial).
+        const std::string& buyerTraderType  = incomingIsBuy
+                                                  ? incomingOrder->getTraderType()
+                                                  : restingOrder->getTraderType();
+        const std::string& sellerTraderType = incomingIsBuy
+                                                  ? restingOrder->getTraderType()
+                                                  : incomingOrder->getTraderType();
+
         Trade trade(buyOrderId, sellOrderId,
                     price, quantity, std::chrono::system_clock::now(),
                     buyerUserId, sellerUserId,
                     incomingOrder->getSide(),          // aggressor_side
-                    incomingOrder->getInstrumentId()); // instrument_id
+                    incomingOrder->getInstrumentId(),  // instrument_id
+                    buyerTraderType,                   // buyer trader type
+                    sellerTraderType);                 // seller trader type
 
         // ── Fill both sides, embedding Trade context into each Order ──────────
         // Any logOrder() call on these orders (now or later, e.g. expiry/cancel)

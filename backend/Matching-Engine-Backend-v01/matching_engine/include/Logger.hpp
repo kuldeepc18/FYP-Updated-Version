@@ -187,6 +187,9 @@ public:
             << ",aggressor_side=NA"              // NA for non-match order events
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash
+            << ",trader_type="        << sanitizeTag(order.getTraderType())
+            << ",buyer_trader_type="  << sanitizeTag(order.getCounterpartyBuyerUid() != "NA" ? order.getTraderType() : std::string("NA"))
+            << ",seller_trader_type=" << sanitizeTag(order.getCounterpartySellerUid() != "NA" ? order.getTraderType() : std::string("NA"))
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << order.getPrice()
@@ -259,6 +262,9 @@ public:
             << ",aggressor_side="     << aggrSide
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash  // aggressor's fingerprint — always present
+            << ",trader_type="        << sanitizeTag((trade.getAggressorSide() == OrderSide::BUY) ? trade.getBuyerTraderType() : trade.getSellerTraderType())
+            << ",buyer_trader_type="  << sanitizeTag(trade.getBuyerTraderType())
+            << ",seller_trader_type=" << sanitizeTag(trade.getSellerTraderType())
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << trade.getPrice()

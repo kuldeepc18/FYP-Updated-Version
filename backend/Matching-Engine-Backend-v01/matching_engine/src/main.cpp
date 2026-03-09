@@ -251,14 +251,40 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (20 per instrument) to generate live order flow ──
-        for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
-            auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 20; ++i) {
+        // ── Start mock traders: 300 retail + 20 spoofing manipulators = 320 ──
+        // Thread count is kept manageable (~320) while producing diverse
+        // trader IDs. Retail traders get auto-IDs 0–299. Spoofing
+        // manipulators get explicit IDs 9980–9999.
+        {
+            const auto& instruments = InstrumentManager::getInstance().getInstruments();
+            int numInstr = static_cast<int>(instruments.size());
+
+            // Phase 1: 20 normal retail traders per instrument = 300 threads
+            for (const auto& instrument : instruments) {
+                auto ob = orderBooks_[instrument.instrumentId];
+                for (int i = 0; i < 20; ++i) {
+                    mockTraders_.emplace_back(
+                        std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_,
+                                                    /*isManipulator=*/false));
+                    mockTraders_.back()->start();
+                }
+            }
+
+            // Phase 2: 20 spoofing manipulators (IDs 9980–9999), spread across instruments
+            for (int s = 0; s < SPOOF_TRADER_COUNT; ++s) {
+                int instrIdx = s % numInstr; // round-robin across instruments
+                const auto& instrument = instruments[instrIdx];
+                auto ob = orderBooks_[instrument.instrumentId];
+                int spoofId = SPOOF_TRADER_BASE_ID + s; // 9980, 9981, .. 9999
                 mockTraders_.emplace_back(
-                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
+                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_,
+                                                /*isManipulator=*/true, spoofId));
                 mockTraders_.back()->start();
             }
+
+            std::fprintf(stderr,
+                "[Engine] Started %d mock traders (300 retail + %d spoofing manipulators)\n",
+                300 + SPOOF_TRADER_COUNT, SPOOF_TRADER_COUNT);
         }
 
         // Main trading loop
