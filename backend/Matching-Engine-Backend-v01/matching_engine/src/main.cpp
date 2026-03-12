@@ -292,6 +292,15 @@ public:
             }
         }
 
+        // ── Start layering manipulation coordinator ──────────────────────────
+        // 15 dedicated threads: userId 1–15. Each manipulator is assigned to
+        // exactly one instrument and runs independent bearish/bullish layering
+        // cycles with large fake orders followed by rapid cancellation and a
+        // small opposite-side profit trade.  IDs 1–15 are reserved (MockTrader
+        // IDs start at 16) so the QuestDB trader_type labels are clean.
+        LayeringCoordinator::instance().init(orderBooks_, &logger_);
+        LayeringCoordinator::instance().start();
+
         // Main trading loop
         running_ = true;
         while (running_ && !g_shutdown.load()) {
@@ -342,6 +351,9 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         running_ = false;
+
+        // Stop layering manipulation coordinator
+        LayeringCoordinator::instance().stop();
 
         // Stop all mock traders
         for (auto& trader : mockTraders_)

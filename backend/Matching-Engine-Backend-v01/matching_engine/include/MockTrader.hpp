@@ -84,6 +84,53 @@ static constexpr double CIRCULAR_PRICE_JITTER    = 0.002; // ±0.2 % price noise
 // Ring member IDs — defines the directed cycle 2500 → 2600 → 2700 → 2800 → 2500
 static const int CIRCULAR_RING_IDS[4] = {2500, 2600, 2700, 2800};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — LAYERING  (userIds 1–15, one manipulator per instrument)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  LAYERING_ACTIVE   master on/off switch.
+//    true  → 15 dedicated threads run a perpetual layering cycle on each of
+//             the 15 instruments.  Each manipulator:
+//               CASE 1 (Bearish Layering) — places 3–7 large SELL LIMIT orders
+//                 across multiple price levels above the current LTP, waits
+//                 100 ms–3 s, cancels all of them, then places a small BUY
+//                 to profit from the artificial sell-wall effect.
+//               CASE 2 (Bullish Layering) — mirrors CASE 1 on the BUY side:
+//                 3–7 large BUY LIMIT orders below LTP → wait → cancel all →
+//                 small SELL at the inflated price.
+//             The two cases are chosen randomly each burst cycle.
+//    false → LayeringCoordinator::start() is a no-op; only normal traders run.
+//
+//  ML-detectable red flags in QuestDB trade_logs:
+//    ✦ High ORDER_NEW count from userIds 1–15 on their respective instruments
+//    ✦ High ORDER_CANCELLED count within 100 ms–3 s of placement
+//    ✦ Cancel-to-order ratio 85–90 %  (<<5 fills for every ~35+ new orders)
+//    ✦ Large order sizes (20 000–80 000) dwarfing normal traders (100–2 000)
+//    ✦ Orders clustered at 3–7 consecutive price levels with 0.2–0.8 % gaps
+//    ✦ Immediate opposite-side small trade after the cancellation burst
+//    ✦ trader_type = "manipulator" on all layering rows
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   LAYERING_ACTIVE        = true;
+static constexpr int    LAYERING_MANIP_COUNT   = 15;     // one per instrument (ids 1–15)
+
+// Fake (spoofed) layering order parameters
+static constexpr size_t LAYERING_QTY_MIN       = 20000;  // shares per fake level
+static constexpr size_t LAYERING_QTY_MAX       = 80000;
+static constexpr int    LAYERING_LEVELS_MIN    = 3;      // price levels per burst
+static constexpr int    LAYERING_LEVELS_MAX    = 7;
+static constexpr double LAYERING_GAP_MIN       = 0.002;  // 0.2 % gap between levels
+static constexpr double LAYERING_GAP_MAX       = 0.008;  // 0.8 % gap between levels
+
+// Spoof window — how long fake orders remain in the book before cancellation
+static constexpr int    LAYERING_CANCEL_MIN_MS = 100;    // 100 ms minimum
+static constexpr int    LAYERING_CANCEL_MAX_MS = 3000;   // 3 s maximum
+
+// Profit trade placed on the opposite side after cancelling fake orders
+static constexpr size_t LAYERING_PROFIT_QTY    = 3000;   // shares — smaller than fake orders
+
+// Idle time between layering burst cycles
+static constexpr int    LAYERING_PAUSE_MIN_MS  = 3000;   // 3 s minimum between bursts
+static constexpr int    LAYERING_PAUSE_MAX_MS  = 8000;   // 8 s maximum between bursts
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +291,213 @@ inline const CircularRingCoordinator::StepSpec CircularRingCoordinator::CYCLE[8]
     {3, OrderSide::SELL, false},  // step 5 : 2800 SELL — matches 2700's BUY  ★
     {3, OrderSide::BUY,  true },  // step 6 : 2800 BUY  — anchors new ringPrice
     {0, OrderSide::SELL, false},  // step 7 : 2500 SELL — matches 2800's BUY  ★
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LayeringCoordinator
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Singleton that manages 15 dedicated manipulator threads — one per instrument.
+//  Each thread independently runs a perpetual layering cycle:
+//
+//    1. Sleep LAYERING_PAUSE_MIN_MS – LAYERING_PAUSE_MAX_MS (burst inter-arrival)
+//    2. Randomly choose CASE 1 (bearish/fake-SELL) or CASE 2 (bullish/fake-BUY)
+//    3. Place LAYERING_LEVELS_MIN–LAYERING_LEVELS_MAX large LIMIT orders at
+//       successive price levels (0.2–0.8 % apart) away from the current LTP.
+//       Each order is logged as ORDER_NEW immediately after addOrder().
+//    4. Sleep LAYERING_CANCEL_MIN_MS – LAYERING_CANCEL_MAX_MS (spoof window).
+//    5. Cancel every still-pending layering order; log ORDER_CANCELLED.
+//    6. Place one small LIMIT-IOC profit order on the OPPOSITE side; log result.
+//
+//  TradingApplication::start() calls:
+//    LayeringCoordinator::instance().init(orderBooks_, &logger_);
+//    LayeringCoordinator::instance().start();
+//  TradingApplication cleanup calls:
+//    LayeringCoordinator::instance().stop();
+// ─────────────────────────────────────────────────────────────────────────────
+class LayeringCoordinator {
+public:
+    static LayeringCoordinator& instance() {
+        static LayeringCoordinator inst;
+        return inst;
+    }
+
+    // Must be called BEFORE start(). Supplies all 15 order books and the logger.
+    void init(const std::map<int, std::shared_ptr<OrderBook>>& orderBooks, Logger* log) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        orderBooks_ = orderBooks;
+        logger_     = log;
+    }
+
+    void start() {
+        if (!LAYERING_ACTIVE) return;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (orderBooks_.empty() || !logger_) return;
+            running_ = true;
+        }
+        // Spawn one thread per instrument/manipulator pair
+        for (int i = 0; i < LAYERING_MANIP_COUNT; ++i) {
+            int         instrId = i + 1;                  // instruments 1–15
+            std::string userId  = std::to_string(i + 1); // userIds    1–15
+            threads_.emplace_back(
+                &LayeringCoordinator::manipulatorLoop, this, instrId, userId);
+        }
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            running_ = false;
+        }
+        for (auto& t : threads_)
+            if (t.joinable()) t.join();
+        threads_.clear();
+    }
+
+private:
+    // ── Per-manipulator thread body ───────────────────────────────────────────
+    void manipulatorLoop(int instrId, const std::string& userId) {
+        // Seed with device entropy XOR'd with a userId-derived value so each
+        // of the 15 threads has an independent random stream.
+        std::mt19937 eng(std::random_device{}() ^
+                         static_cast<uint32_t>(std::hash<std::string>{}(userId)));
+
+        std::uniform_int_distribution<int>     pauseDist (LAYERING_PAUSE_MIN_MS,  LAYERING_PAUSE_MAX_MS);
+        std::uniform_int_distribution<int>     cancelDist(LAYERING_CANCEL_MIN_MS, LAYERING_CANCEL_MAX_MS);
+        std::uniform_int_distribution<int>     levelsDist(LAYERING_LEVELS_MIN,    LAYERING_LEVELS_MAX);
+        std::uniform_int_distribution<size_t>  qtyDist   (LAYERING_QTY_MIN,       LAYERING_QTY_MAX);
+        std::uniform_real_distribution<double> gapDist   (LAYERING_GAP_MIN,       LAYERING_GAP_MAX);
+        std::uniform_int_distribution<int>     caseDist  (0, 1); // 0=CASE1, 1=CASE2
+
+        while (running_) {
+            // ── 1. Inter-burst idle ───────────────────────────────────────────
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(pauseDist(eng)));
+            if (!running_) break;
+
+            // Fetch the order book for this instrument
+            std::shared_ptr<OrderBook> ob;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = orderBooks_.find(instrId);
+                if (it == orderBooks_.end()) continue;
+                ob = it->second;
+            }
+
+            double ltp = InstrumentManager::getInstance().getLTP(instrId);
+            if (ltp <= 0.0) continue;
+
+            // ── 2. Choose manipulation case ───────────────────────────────────
+            // CASE 1: bearish — fake SELL wall above LTP → price dips → BUY profit
+            // CASE 2: bullish — fake BUY  wall below LTP → price rises → SELL profit
+            const bool isCase1 = (caseDist(eng) == 0);
+            const int  levels  = levelsDist(eng);
+
+            // ── 3. Place fake layering orders ─────────────────────────────────
+            // Each level uses an independently sampled gap, creating realistic
+            // non-uniform spacing between price levels in the order book.
+            std::vector<std::shared_ptr<Order>> layeringOrders;
+            layeringOrders.reserve(static_cast<size_t>(levels));
+
+            for (int lvl = 1; lvl <= levels; ++lvl) {
+                if (!running_) break;
+
+                const double gap   = gapDist(eng);             // 0.2–0.8 % per level
+                const size_t qty   = qtyDist(eng);             // 20 000–80 000 shares
+                double       price;
+                OrderSide    side;
+
+                if (isCase1) {
+                    // CASE 1: SELL orders stacked ABOVE current LTP
+                    side  = OrderSide::SELL;
+                    price = ltp * (1.0 + gap * static_cast<double>(lvl));
+                } else {
+                    // CASE 2: BUY orders stacked BELOW current LTP
+                    side  = OrderSide::BUY;
+                    price = ltp * (1.0 - gap * static_cast<double>(lvl));
+                }
+                price = std::round(price * 100.0) / 100.0; // 2 d.p. rounding
+
+                auto order = std::make_shared<Order>(
+                    OrderType::LIMIT, side, price, qty,
+                    TimeInForce::GTC, userId, instrId);
+
+                ob->addOrder(order);
+                // Log ORDER_NEW immediately — fake order is now visible in the book
+                if (logger_) logger_->logOrder(*order);
+                layeringOrders.push_back(order);
+            }
+
+            if (layeringOrders.empty()) continue;
+
+            // ── 4. Spoof window — orders sit in the book creating artificial pressure
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(cancelDist(eng)));
+
+            // ── 5. Cancel all fake orders ─────────────────────────────────────
+            cancelLayeringOrders(ob, layeringOrders);
+            if (!running_) break;
+
+            // ── 6. Profit trade — small opposite-side LIMIT-IOC ───────────────
+            // IOC ensures the order is either filled immediately against existing
+            // book liquidity or discarded — it never rests in the book, keeping
+            // the manipulator's footprint minimal after the spoof window closes.
+            double    ltp2       = InstrumentManager::getInstance().getLTP(instrId);
+            OrderSide profitSide;
+            double    profitPrice;
+
+            if (isCase1) {
+                // After fake SELL pressure: BUY at slightly above LTP to cross spread
+                profitSide  = OrderSide::BUY;
+                profitPrice = std::round(ltp2 * 1.005 * 100.0) / 100.0;
+            } else {
+                // After fake BUY pressure: SELL at slightly below LTP to cross spread
+                profitSide  = OrderSide::SELL;
+                profitPrice = std::round(ltp2 * 0.995 * 100.0) / 100.0;
+            }
+
+            auto profitOrder = std::make_shared<Order>(
+                OrderType::LIMIT, profitSide, profitPrice, LAYERING_PROFIT_QTY,
+                TimeInForce::IOC, userId, instrId);
+
+            ob->addOrder(profitOrder);
+            // logOrder() will capture the final status (FILLED, PARTIALLY_FILLED,
+            // or CANCELLED-by-IOC if no counterparty was found).
+            if (logger_) logger_->logOrder(*profitOrder);
+        }
+    }
+
+    // ── Cancel all still-pending layering orders and log ORDER_CANCELLED ──────
+    void cancelLayeringOrders(
+        const std::shared_ptr<OrderBook>&         ob,
+        const std::vector<std::shared_ptr<Order>>& orders)
+    {
+        for (const auto& order : orders) {
+            if (!order) continue;
+            const auto s = order->getStatus();
+            if (s == OrderStatus::NEW || s == OrderStatus::PARTIALLY_FILLED) {
+                ob->cancelOrder(order->getOrderId());
+                // order->cancel() has been called inside cancelOrder() —
+                // the shared_ptr still points to the same object with
+                // status = CANCELLED and a valid cancelTimestamp.
+                if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
+                    logger_->logOrder(*order);
+            }
+        }
+    }
+
+    // ── Private constructor / copy-delete (singleton) ─────────────────────────
+    LayeringCoordinator()  = default;
+    ~LayeringCoordinator() { stop(); }
+    LayeringCoordinator(const LayeringCoordinator&)            = delete;
+    LayeringCoordinator& operator=(const LayeringCoordinator&) = delete;
+
+    // ── Members ───────────────────────────────────────────────────────────────
+    std::map<int, std::shared_ptr<OrderBook>> orderBooks_;
+    Logger*                                   logger_  = nullptr;
+    bool                                      running_ = false;
+    std::mutex                                mtx_;
+    std::vector<std::thread>                  threads_;
 };
 
 
@@ -683,6 +937,6 @@ private:
     std::vector<std::shared_ptr<Order>> pendingGTCOrders_;
 };
 
-int MockTrader::mockTraderCount = 0;
+int MockTrader::mockTraderCount = 16; // IDs 1-15 reserved for LayeringCoordinator manipulators
 
 #endif // MOCK_TRADER_HPP

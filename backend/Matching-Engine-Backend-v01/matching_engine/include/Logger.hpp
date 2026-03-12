@@ -201,6 +201,12 @@ public:
             << ",aggressor_side=NA"              // NA for non-match order events
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash
+            // ── trader-type classification tags ────────────────────────────
+            // trader_type   : derived from the order placer's userId.
+            // buyer/seller  : NA for non-TRADE_MATCH rows (per specification).
+            << ",trader_type="        << (isManipulatorId(order.getTraderId()) ? "manipulator" : "normal")
+            << ",buyer_trader_type=NA"
+            << ",seller_trader_type=NA"
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << order.getPrice()
@@ -273,6 +279,18 @@ public:
             << ",aggressor_side="     << aggrSide
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash  // aggressor's fingerprint — always present
+            // ── trader-type classification tags ────────────────────────────
+            // trader_type        : "manipulator" when the AGGRESSOR is a manipulator
+            //                      (i.e. the order that crossed the spread), else "normal".
+            //                      Matches RULE 1 (manip BUY aggressor → manipulator)
+            //                      and RULE 2 (manip SELL aggressor → manipulator);
+            //                      RULE 3/4 give "normal" when normal trader is aggressor
+            //                      even if the resting counterparty is a manipulator.
+            // buyer_trader_type  : based on the actual buyer's userId.
+            // seller_trader_type : based on the actual seller's userId.
+            << ",trader_type="        << (isManipulatorId(aggrUserId)                  ? "manipulator" : "normal")
+            << ",buyer_trader_type="  << (isManipulatorId(trade.getBuyerUserId())     ? "manipulator" : "normal")
+            << ",seller_trader_type=" << (isManipulatorId(trade.getSellerUserId())    ? "manipulator" : "normal")
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << trade.getPrice()
@@ -388,6 +406,19 @@ private:
         if (istMin >= 540 && istMin < 555) return "PRE_OPEN";
         if (istMin >= 555 && istMin < 930) return "OPEN";
         return "CLOSED";
+    }
+
+    // ── Manipulator identity check ─────────────────────────────────────────────
+    // Returns true when userId is a pure integer in [1, 15] — the range reserved
+    // exclusively for LayeringCoordinator manipulators (one per instrument).
+    // Used to compute trader_type / buyer_trader_type / seller_trader_type tags
+    // for every row written to QuestDB without relying on any runtime state.
+    static bool isManipulatorId(const std::string& userId) {
+        if (userId.empty()) return false;
+        char*  end;
+        long   id = std::strtol(userId.c_str(), &end, 10);
+        // end must point to '\0' (pure integer, no trailing chars).
+        return (end != userId.c_str() && *end == '\0' && id >= 1 && id <= 15);
     }
 
     // Replace ILP tag-special characters (space, comma, equals) with underscore.
