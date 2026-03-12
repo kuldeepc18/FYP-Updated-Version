@@ -124,8 +124,8 @@ static constexpr int    SPOOF_CANCEL_WAIT_MIN_MS  = 300;     // how long the fak
 static constexpr int    SPOOF_CANCEL_WAIT_MAX_MS  = 1200;
 static constexpr double SPOOF_CANCEL_RATE_MIN     = 0.65;    // variable cancel rate, >60 %
 static constexpr double SPOOF_CANCEL_RATE_MAX     = 0.92;
-static constexpr int    SPOOF_PAUSE_MIN_MS        = 800;     // pause between spoof cycles
-static constexpr int    SPOOF_PAUSE_MAX_MS        = 3000;
+static constexpr int    SPOOF_PAUSE_MIN_MS        = 120;     // pause between spoof cycles (reduced for higher frequency)
+static constexpr int    SPOOF_PAUSE_MAX_MS        = 450;      // reduced to generate 45k-50k manipulative trades
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
@@ -367,10 +367,9 @@ private:
         std::uniform_int_distribution<int>      typeDist(0, 3); // 0 → MARKET (25%)
 
         while (running_) {
-            // ── 15% chance to cancel one resting GTC order before placing a
-            //    new one — retail traders regularly change their minds or adjust
-            //    to news, creating realistic ORDER_CANCELLED events.
-            maybeCancelGTCOrder(0.15);
+            // ── 52% chance to cancel one resting GTC order before placing a
+            //    new one — realistic market cancellation rate per financial market data
+            maybeCancelGTCOrder(0.52);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -425,10 +424,9 @@ private:
         std::uniform_real_distribution<double> uni(0.0, 1.0);
 
         while (running_) {
-            // ── 12% chance to cancel a pending order that may now be against
-            //    the updated trend direction — a realistic momentum-trader
-            //    risk-management step before reassessing the market.
-            maybeCancelGTCOrder(0.12);
+            // ── 48% chance to cancel a pending order that may now be against
+            //    the updated trend direction — realistic cancellation rate per market data
+            maybeCancelGTCOrder(0.48);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -486,10 +484,9 @@ private:
         std::uniform_real_distribution<double> uni(0.0, 1.0);
 
         while (running_) {
-            // ── 10% chance to cancel a resting order whose price may now be
-            //    far from the updated rolling mean — mean-reversion traders
-            //    cull stale orders whenever the mean shifts significantly.
-            maybeCancelGTCOrder(0.10);
+            // ── 45% chance to cancel a resting order whose price may now be
+            //    far from the updated rolling mean — realistic market cancellation rate
+            maybeCancelGTCOrder(0.45);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
