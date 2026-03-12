@@ -92,7 +92,7 @@ echo ""
 # --- 3. Run ------------------------------------------------------------------
 echo "Starting matching engine..."
 echo "  Orders (NEW/PARTIAL/FILLED/CANCELLED/EXPIRED) -> QuestDB table: trade_logs"
-echo "  Order expiry: 5 seconds after placement if unfilled"
+echo "  Order expiry: 120 seconds after placement if unfilled"
 echo "  PID file: $PID_FILE  (use 'kill \$(cat $PID_FILE)' to stop remotely)"
 echo ""
 

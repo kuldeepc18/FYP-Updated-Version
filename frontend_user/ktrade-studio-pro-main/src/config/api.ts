@@ -56,6 +56,7 @@ export const API_ENDPOINTS = {
     POSITIONS: '/user/positions',
     POSITIONS_EXIT: '/user/positions/exit',
     POSITIONS_EXIT_ALL: '/user/positions/exit-all',
+    POSITIONS_TARGET_SL: '/user/positions/target-sl', // PATCH with { symbol, targetPrice, stopLoss }
   },
   MARKET: {
     QUOTES: '/market/quotes',

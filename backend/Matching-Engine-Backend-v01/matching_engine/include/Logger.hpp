@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <csignal>  // signal(), SIGPIPE, SIG_IGN
 #include "Order.hpp"
 #include "Trade.hpp"
 
@@ -105,17 +106,30 @@ public:
 #ifdef _WIN32
         WSADATA wsaData;
         WSAStartup(MAKEWORD(2, 2), &wsaData);
+#else
+        // ── Suppress SIGPIPE process-wide on Linux ────────────────────────────
+        // CRITICAL: Without this, any ::send() on a closed QuestDB ILP socket
+        // (port 9009) raises SIGPIPE and KILLS THE ENGINE SILENTLY, causing every
+        // subsequent trade to go unrecorded in QuestDB.  With SIG_IGN, ::send()
+        // returns -1/EPIPE instead and the reconnect logic in sendILP() handles
+        // it transparently.  This flag is process-wide so it covers every socket
+        // in the engine (book HTTP server, QuestDB REST queries, etc.).
+        ::signal(SIGPIPE, SIG_IGN);
 #endif
         if (!connectToQuestDB()) {
-            std::fprintf(stderr,
-                "\n[Logger] WARNING: Cannot connect to QuestDB at %s:%d\n"
-                "         Trade data will NOT be stored until QuestDB is reachable.\n"
-                "         Start QuestDB first, then run the matching engine.\n\n",
+            std::printf(
+                "\n[Logger] *** CRITICAL WARNING ***\n"
+                "         Cannot connect to QuestDB ILP at %s:%d.\n"
+                "         ALL trades (mock + user) will be LOST until QuestDB is reachable.\n"
+                "         Start QuestDB first, then restart the matching engine.\n\n",
                 questdbHost_.c_str(), questdbPort_);
+            std::fflush(stdout);
         } else {
-            std::fprintf(stderr,
-                "[Logger] Connected to QuestDB at %s:%d — trade_logs table ready.\n",
+            std::printf(
+                "[Logger] Connected to QuestDB ILP at %s:%d"
+                " — ALL trades will be stored in trade_logs.\n",
                 questdbHost_.c_str(), questdbPort_);
+            std::fflush(stdout);
         }
     }
 
@@ -295,18 +309,36 @@ private:
         return true;
     }
 
-    void sendILP(const std::string& ilpLine) {
-        if (sock_ == INVALID_SOCK) connectToQuestDB();
-        if (sock_ == INVALID_SOCK) return;
+    // ── sendAll() ─────────────────────────────────────────────────────────────
+    // Delivers every byte in [data, data+len) using a partial-write loop.
+    // MSG_NOSIGNAL (Linux): converts a broken-pipe from SIGPIPE (which would
+    // kill the process) into a plain EPIPE return value that we can handle.
+    // Returns true if all bytes were delivered; false on any error.
+    static bool sendAll(socket_t s, const char* data, size_t len) {
+        while (len > 0) {
 #ifdef _WIN32
-        int sent = ::send(sock_, ilpLine.c_str(), static_cast<int>(ilpLine.size()), 0);
+            int sent = ::send(s, data, static_cast<int>(len), 0);
 #else
-        ssize_t sent = ::send(sock_, ilpLine.c_str(), ilpLine.size(), 0);
+            ssize_t sent = ::send(s, data, len, MSG_NOSIGNAL);
 #endif
-        if (sent <= 0) {
+            if (sent <= 0) return false;
+            data += static_cast<size_t>(sent);
+            len  -= static_cast<size_t>(sent);
+        }
+        return true;
+    }
+
+    void sendILP(const std::string& ilpLine) {
+        // Reconnect if the socket was previously broken.
+        if (sock_ == INVALID_SOCK) connectToQuestDB();
+        if (sock_ == INVALID_SOCK) return;  // QuestDB still unreachable — drop row
+
+        if (!sendAll(sock_, ilpLine.c_str(), ilpLine.size())) {
+            // Delivery failed (broken pipe or partial write).
+            // Close the dead socket, reconnect once, and retry the row.
             close_sock(sock_); sock_ = INVALID_SOCK;
             if (connectToQuestDB())
-                ::send(sock_, ilpLine.c_str(), ilpLine.size(), 0);
+                sendAll(sock_, ilpLine.c_str(), ilpLine.size());
         }
     }
 
@@ -393,7 +425,7 @@ private:
 #ifdef _WIN32
             ::send(s, req.c_str(), static_cast<int>(req.size()), 0);
 #else
-            ::send(s, req.c_str(), req.size(), 0);
+            ::send(s, req.c_str(), req.size(), MSG_NOSIGNAL);
 #endif
             char buf[512];
             while (::recv(s, buf, sizeof(buf), 0) > 0) {}

@@ -170,10 +170,8 @@ private:
                 side = spec.side;
 
                 if (spec.setPrice) {
-                    // BUY step — anchor a fresh ring price from the live market
-                    const Instrument* instr =
-                        InstrumentManager::getInstance().getInstrumentById(instrId_);
-                    double mkt = instr ? instr->marketPrice : 100.0;
+                    // BUY step — anchor a fresh ring price from the live LTP
+                    double mkt = InstrumentManager::getInstance().getLTP(instrId_);
                     price      = std::round(mkt * jitter(eng) * 100.0) / 100.0;
                     ringPrice_ = price; // stored so the next SELL step can reuse it
                 } else {
@@ -251,18 +249,24 @@ inline const CircularRingCoordinator::StepSpec CircularRingCoordinator::CYCLE[8]
 
 class MockTrader {
 public:
+    // ── Trader archetypes ─────────────────────────────────────────────────────
+    // Assignment per instrument (200 traders total):
+    //   i <  10 → MARKET_MAKER   (10,  5%) — continuous two-sided quotes
+    //   i <  60 → MOMENTUM       (50, 25%) — trend-following, LTP history driven
+    //   i <  80 → MEAN_REVERSION (20, 10%) — buys dips, sells rallies
+    //   i < 200 → NOISE          (120,60%) — OU-biased random retail orders
+    enum class Archetype { NOISE, MOMENTUM, MEAN_REVERSION, MARKET_MAKER };
+
     static int mockTraderCount;
 
-    MockTrader(std::shared_ptr<OrderBook> orderBook, int instrumentId, Logger* logger = nullptr)
+    MockTrader(std::shared_ptr<OrderBook> orderBook, int instrumentId,
+               Logger* logger = nullptr, Archetype archetype = Archetype::NOISE)
         : orderBook_(orderBook)
         , instrumentId_(instrumentId)
         , running_(false)
+        , archetype_(archetype)
         , engine_(std::random_device{}())
-        , priceDistribution_(0.95, 1.05)    // ±5 % of market price  (retail)
-        , quantityDistribution_(1, 100)      // 1–100 shares           (retail)
-        , sleepDistribution_(100, 2000)      // 100–2000 ms think time (retail)
-        , sideDistribution_(0, 1)           // random BUY / SELL      (retail)
-        , washPriceJitter_(0.999, 1.001)    // ±0.1 % price noise     (wash)
+        , washPriceJitter_(0.999, 1.001) // ±0.1 % price noise (wash trader)
         , logger_(logger)
     {
         if (mockTraderCount >= 10000)
@@ -271,15 +275,9 @@ public:
         int myId  = mockTraderCount++;
         traderId_ = std::to_string(myId);
 
-        // ── Designate trader #2500 as the wash-trade manipulator ─────────────
-        // Flip WASH_TRADER_ACTIVE to false to revert #2500 to retail behaviour.
+        // Designate trader #2500 as the wash-trade manipulator.
+        // Flip WASH_TRADER_ACTIVE to false to revert #2500 to its assigned archetype.
         isWashTrader_ = (WASH_TRADER_ACTIVE && myId == WASH_TRADER_USER_ID);
-
-        // ── Note: traders 2500 / 2600 / 2700 / 2800 additionally participate
-        // in the circular trading ring via CircularRingCoordinator (separate
-        // threads).  Their MockTrader thread continues its primary behaviour
-        // (wash for 2500, retail for 2600/2700/2800) on their assigned instrument
-        // while the ring coordinator fires ring orders on instrument 1 (RELIANCE).
     }
 
     void start() {
@@ -297,71 +295,270 @@ private:
     Logger* logger_;
 
     // ──────────────────────────────────────────────────────────────────────────
-    //  RETAIL TRADER  (9996 normal mock traders plus 2600 / 2700 / 2800)
-    //  Behaviour: random side, random order type, random price & quantity.
-    //  Represents normal market participants with no coordinated intent.
+    //  NOISE TRADER  (120 per instrument, 60%)
+    //
+    //  Enhanced retail trader that:
+    //    • Uses true LTP (not stale mid-price) as the reference price
+    //    • Uses OU priceTrend to bias buy/sell probability
+    //    • Reduced spread ±2% (was ±5%) so more orders actually match
+    //    • 25% chance of MARKET order (IOC); 75% LIMIT (GTC)
+    //
+    //  Buy probability = clamp(0.5 + priceTrend × 0.5, 0.1, 0.9)
+    //    priceTrend = +0.20 → buyProb = 0.60 (60% buyers)
+    //    priceTrend = −0.20 → buyProb = 0.40 (40% buyers)
     // ──────────────────────────────────────────────────────────────────────────
-    void runRetail() {
+    void runNoise() {
+        std::uniform_int_distribution<int>     sleepDist(100, 2000);
+        std::uniform_real_distribution<double>  spreadDist(0.98, 1.02); // ±2%
+        std::uniform_int_distribution<size_t>   qtyDist(1, 100);
+        std::uniform_real_distribution<double>  uni(0.0, 1.0);
+        std::uniform_int_distribution<int>      typeDist(0, 3); // 0 → MARKET (25%)
+
         while (running_) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(sleepDistribution_(engine_)));
+            // ── 15% chance to cancel one resting GTC order before placing a
+            //    new one — retail traders regularly change their minds or adjust
+            //    to news, creating realistic ORDER_CANCELLED events.
+            maybeCancelGTCOrder(0.15);
 
-            auto      side      = sideDistribution_(engine_) == 0
-                                      ? OrderSide::BUY : OrderSide::SELL;
-            OrderType orderType = (quantityDistribution_(engine_) % 2 == 0)
-                                      ? OrderType::LIMIT : OrderType::MARKET;
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
-            const Instrument* instr =
-                InstrumentManager::getInstance().getInstrumentById(instrumentId_);
-            double basePrice = instr ? instr->marketPrice : 100.0;
-            double price     = basePrice * priceDistribution_(engine_);
-            auto   quantity  = quantityDistribution_(engine_);
+            double ltp    = InstrumentManager::getInstance().getLTP(instrumentId_);
+            double trend  = InstrumentManager::getInstance().getPriceTrend(instrumentId_);
+            // Clamp buy probability to [0.1, 0.9]
+            double buyProb = std::max(0.1, std::min(0.9, 0.5 + trend * 0.5));
 
+            OrderSide side      = (uni(engine_) < buyProb) ? OrderSide::BUY : OrderSide::SELL;
+            bool      isMarket  = (typeDist(engine_) == 0);
+            OrderType orderType = isMarket ? OrderType::MARKET : OrderType::LIMIT;
+
+            double      price;
+            TimeInForce tif;
+            if (isMarket) {
+                // MARKET orders: slight buffer toward the direction, IOC so
+                // unmatched portion is dropped immediately (not added to book).
+                price = (side == OrderSide::BUY) ? ltp * 1.002 : ltp * 0.998;
+                tif   = TimeInForce::IOC;
+            } else {
+                price = ltp * spreadDist(engine_);
+                tif   = TimeInForce::GTC;
+            }
+
+            auto qty   = qtyDist(engine_);
             auto order = std::make_shared<Order>(
-                orderType, side, price, quantity,
-                TimeInForce::GTC, traderId_, instrumentId_);
-
+                orderType, side, price, qty, tif, traderId_, instrumentId_);
             orderBook_->addOrder(order);
             if (logger_) logger_->logOrder(*order);
+            // Track GTC LIMIT orders so they are eligible for future cancellation.
+            // IOC / MARKET orders dispose of themselves and are not tracked.
+            if (!isMarket) trackGTCOrder(order);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  MOMENTUM TRADER  (50 per instrument, 25%)
+    //
+    //  Reads the last 5 LTP values and chases short-term price direction:
+    //    shortReturn = (hist[4] − hist[0]) / hist[0]
+    //    > +0.002 → 70% BUY,  price = ltp × 1.003 (direction-chasing)
+    //    < −0.002 → 30% BUY,  price = ltp × 0.997
+    //    else     → falls back to OU priceTrend bias
+    //
+    //  Acts as a positive-feedback amplifier: rising LTP creates more buy orders
+    //  → more matches → LTP rises further → more momentum buying.
+    //  The OU mean-reversion in priceTrend eventually terminates the trend.
+    // ──────────────────────────────────────────────────────────────────────────
+    void runMomentum() {
+        std::uniform_int_distribution<int>     sleepDist(200, 1500);
+        std::uniform_int_distribution<size_t>  qtyDist(5, 50);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+        while (running_) {
+            // ── 12% chance to cancel a pending order that may now be against
+            //    the updated trend direction — a realistic momentum-trader
+            //    risk-management step before reassessing the market.
+            maybeCancelGTCOrder(0.12);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
+
+            double ltp    = InstrumentManager::getInstance().getLTP(instrumentId_);
+            auto   hist   = InstrumentManager::getInstance().getLTPHistory(instrumentId_, 5);
+
+            double buyBias   = 0.5;
+
+            if (hist.size() >= 2) {
+                double shortReturn = (hist.back() - hist.front()) / hist.front();
+                if (shortReturn > 0.002) {
+                    buyBias   = 0.70;
+                } else if (shortReturn < -0.002) {
+                    buyBias   = 0.30;
+                } else {
+                    double trend = InstrumentManager::getInstance().getPriceTrend(instrumentId_);
+                    buyBias = std::max(0.1, std::min(0.9, 0.5 + trend * 0.5));
+                }
+            } else {
+                double trend = InstrumentManager::getInstance().getPriceTrend(instrumentId_);
+                buyBias = std::max(0.1, std::min(0.9, 0.5 + trend * 0.5));
+            }
+
+            OrderSide side = (uni(engine_) < buyBias) ? OrderSide::BUY : OrderSide::SELL;
+            // Place order slightly in the momentum direction (0.3% offset)
+            double actualDir = (side == OrderSide::BUY) ? 1.0 : -1.0;
+            double price     = ltp * (1.0 + actualDir * 0.003);
+            auto   qty       = qtyDist(engine_);
+
+            auto order = std::make_shared<Order>(
+                OrderType::LIMIT, side, price, qty,
+                TimeInForce::GTC, traderId_, instrumentId_);
+            orderBook_->addOrder(order);
+            if (logger_) logger_->logOrder(*order);
+            // Track for future cancellation when the trend reverses.
+            trackGTCOrder(order);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  MEAN-REVERSION TRADER  (20 per instrument, 10%)
+    //
+    //  Computes the rolling average of the last 20 LTP samples:
+    //    deviation = (currentLTP − ltpAvg) / ltpAvg
+    //    > +1%  → sell bias (60% SELL) — price above mean, expect reversion
+    //    < −1%  → buy  bias (60% BUY)  — price below mean, expect bounce
+    //
+    //  Order price is anchored toward the rolling mean, not at LTP.
+    //  These traders act as the natural damper that limits trend extension,
+    //  opposing the momentum traders and creating realistic oscillation.
+    // ──────────────────────────────────────────────────────────────────────────
+    void runMeanReversion() {
+        std::uniform_int_distribution<int>     sleepDist(300, 2000);
+        std::uniform_int_distribution<size_t>  qtyDist(5, 50);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+        while (running_) {
+            // ── 10% chance to cancel a resting order whose price may now be
+            //    far from the updated rolling mean — mean-reversion traders
+            //    cull stale orders whenever the mean shifts significantly.
+            maybeCancelGTCOrder(0.10);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
+
+            double ltp    = InstrumentManager::getInstance().getLTP(instrumentId_);
+            auto   hist   = InstrumentManager::getInstance().getLTPHistory(instrumentId_, 20);
+
+            double buyBias    = 0.5;
+            double targetPrice = ltp;
+
+            if (hist.size() >= 5) {
+                double sum = 0.0;
+                for (double v : hist) sum += v;
+                double ltpAvg   = sum / hist.size();
+                double deviation = (ltp - ltpAvg) / ltpAvg;
+
+                if (deviation > 0.01) {
+                    // Price above rolling mean — lean sell
+                    buyBias     = 0.40;
+                    targetPrice = ltpAvg * 0.999; // target a little below the mean
+                } else if (deviation < -0.01) {
+                    // Price below rolling mean — lean buy
+                    buyBias     = 0.60;
+                    targetPrice = ltpAvg * 1.001; // target a little above the mean
+                } else {
+                    targetPrice = ltpAvg;
+                }
+            }
+
+            OrderSide side = (uni(engine_) < buyBias) ? OrderSide::BUY : OrderSide::SELL;
+            auto qty       = qtyDist(engine_);
+            // Price converges toward the rolling average (mean-reverting anchor)
+            double price = (side == OrderSide::BUY) ? targetPrice * 1.001 : targetPrice * 0.999;
+
+            auto order = std::make_shared<Order>(
+                OrderType::LIMIT, side, price, qty,
+                TimeInForce::GTC, traderId_, instrumentId_);
+            orderBook_->addOrder(order);
+            if (logger_) logger_->logOrder(*order);
+            // Track for future cancellation when the mean shifts.
+            trackGTCOrder(order);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  MARKET MAKER  (10 per instrument, 5%)
+    //
+    //  Always places TWO resting limit orders simultaneously:
+    //    BUY  at ltp × (1 − 0.002)  — 0.2% below LTP
+    //    SELL at ltp × (1 + 0.002)  — 0.2% above LTP
+    //  Total spread = 0.4%. Quantity: 5–30 shares (small lots for high turnover).
+    //  Sleep: 50–500 ms (the most active archetype).
+    //
+    //  Market makers guarantee continuous two-sided liquidity.  Without them,
+    //  directional blobs of orders have no counterparty and MARKET orders fail.
+    //  Their tight quotes also keep the best bid-ask spread realistic and ensure
+    //  that noise traders' ±2% orders frequently find a resting counterparty.
+    //
+    //  Price impact: as LTP rises, the market maker's freshly placed ask rises
+    //  with it, so their quotes always anchor near the true market clearing price.
+    // ──────────────────────────────────────────────────────────────────────────
+    void runMarketMaker() {
+        std::uniform_int_distribution<int>    sleepDist(50, 500);
+        std::uniform_int_distribution<size_t> qtyDist(5, 30);
+        const double halfSpread = 0.002; // 0.2% each side (0.4% total)
+
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
+
+            // ── Cancel ALL stale resting quotes before refreshing ─────────────
+            // Real market makers perform a continuous cancel-and-replace cycle:
+            // they pull their old bid/ask from the book whenever the LTP moves
+            // so that their quotes always sit near the current fair value.
+            // This produces a steady stream of ORDER_CANCELLED events —
+            // exactly as seen in production exchange data.
+            // Probability 0.80: on 4 out of 5 iterations all old quotes are
+            // cancelled; the remaining 1 in 5 lets a quote stay to simulate
+            // deliberate passive resting (adds realism without being 100%).
+            maybeCancelGTCOrder(0.80);
+
+            double ltp = InstrumentManager::getInstance().getLTP(instrumentId_);
+            auto   qty = qtyDist(engine_);
+
+            // Place BUY quote below LTP
+            auto buyOrder = std::make_shared<Order>(
+                OrderType::LIMIT, OrderSide::BUY,
+                ltp * (1.0 - halfSpread), qty,
+                TimeInForce::GTC, traderId_, instrumentId_);
+            orderBook_->addOrder(buyOrder);
+            if (logger_) logger_->logOrder(*buyOrder);
+            // Track the new bid so it can be cancelled on the next iteration.
+            trackGTCOrder(buyOrder);
+
+            // Place SELL quote above LTP
+            auto sellOrder = std::make_shared<Order>(
+                OrderType::LIMIT, OrderSide::SELL,
+                ltp * (1.0 + halfSpread), qty,
+                TimeInForce::GTC, traderId_, instrumentId_);
+            orderBook_->addOrder(sellOrder);
+            if (logger_) logger_->logOrder(*sellOrder);
+            // Track the new ask so it can be cancelled on the next iteration.
+            trackGTCOrder(sellOrder);
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
     //  WASH TRADER  (trader #2500 only, when WASH_TRADER_ACTIVE == true)
     //
-    //  What wash trading looks like in QuestDB trade_logs:
-    //
-    //    user_id │ side │  price  │   qty  │ status
-    //    ────────┼──────┼─────────┼────────┼───────
-    //      2500  │ BUY  │ 150.12  │ 10 000 │ NEW     ← Leg 1
-    //      2500  │ SELL │ 150.12  │ 10 000 │ NEW     ← Leg 2 (identical price & qty)
-    //      2500  │ BUY  │ 150.13  │ 10 000 │ NEW     ← next pair
-    //      2500  │ SELL │ 150.13  │ 10 000 │ NEW
-    //      … × WASH_BURST_PAIRS pairs, then pause …
-    //
-    //  ML red-flag signals baked into every burst:
-    //    ✦ Same user_id (2500) on back-to-back BUY and SELL
-    //    ✦ Identical price on both legs of each pair
-    //    ✦ Identical large quantity on both legs (WASH_QUANTITY = 10 000)
-    //    ✦ No net position change across any burst
-    //    ✦ High self-trade ratio vs. total orders placed
-    //    ✦ Periodic burst pattern in time-series (burst → pause → burst)
+    //  Back-to-back BUY + SELL at the same price and quantity — fake volume
+    //  with zero net position change.  ML red-flag signals:
+    //    ✦ Same user_id on consecutive BUY and SELL
+    //    ✦ Identical price+quantity on both legs
+    //    ✦ Periodic burst pattern in time-series
     // ──────────────────────────────────────────────────────────────────────────
     void runWash() {
         while (running_) {
-
             for (int pair = 0; pair < WASH_BURST_PAIRS && running_; ++pair) {
+                // Use true LTP (not stale marketPrice) as the wash price anchor
+                double ltp       = InstrumentManager::getInstance().getLTP(instrumentId_);
+                double washPrice = ltp * washPriceJitter_(engine_);
+                washPrice = std::round(washPrice * 100.0) / 100.0;
 
-                const Instrument* instr =
-                    InstrumentManager::getInstance().getInstrumentById(instrumentId_);
-                double marketPrice = instr ? instr->marketPrice : 100.0;
-
-                // Tiny jitter keeps the price from looking artificially static,
-                // but BOTH legs of each pair share the EXACT same washPrice.
-                double washPrice = marketPrice * washPriceJitter_(engine_);
-                washPrice = std::round(washPrice * 100.0) / 100.0; // 2 d.p.
-
-                // ── Leg 1 : BUY ──────────────────────────────────────────────
                 auto buyOrder = std::make_shared<Order>(
                     OrderType::LIMIT, OrderSide::BUY,
                     washPrice, WASH_QUANTITY,
@@ -369,51 +566,121 @@ private:
                 orderBook_->addOrder(buyOrder);
                 if (logger_) logger_->logOrder(*buyOrder);
 
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(WASH_INTERVAL_MS));
+                std::this_thread::sleep_for(std::chrono::milliseconds(WASH_INTERVAL_MS));
                 if (!running_) break;
 
-                // ── Leg 2 : SELL — mirrors Leg 1 exactly ─────────────────────
                 auto sellOrder = std::make_shared<Order>(
                     OrderType::LIMIT, OrderSide::SELL,
-                    washPrice,      // ← same price as BUY  (red flag ✦)
-                    WASH_QUANTITY,  // ← same qty  as BUY   (red flag ✦)
+                    washPrice,      // same price — red flag ✦
+                    WASH_QUANTITY,  // same qty   — red flag ✦
                     TimeInForce::GTC, traderId_, instrumentId_);
                 orderBook_->addOrder(sellOrder);
                 if (logger_) logger_->logOrder(*sellOrder);
 
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(WASH_INTERVAL_MS));
+                std::this_thread::sleep_for(std::chrono::milliseconds(WASH_INTERVAL_MS));
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(WASH_PAUSE_MS));
+        }
+    }
 
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(WASH_PAUSE_MS));
+    // ──────────────────────────────────────────────────────────────────────────
+    //  GTC ORDER TRACKING / CANCELLATION HELPERS
+    //
+    //  In real markets every trader type actively cancels orders:
+    //    • Market makers  : cancel stale quotes before posting refreshed ones.
+    //    • Momentum traders: cancel orders when the trend that prompted them
+    //                        reverses.
+    //    • Mean-reversion  : cancel orders that have drifted far from the
+    //                        current rolling mean.
+    //    • Noise traders   : cancel at random (changed plans, risk management).
+    //
+    //  Each archetype tracks its placed GTC LIMIT orders in pendingGTCOrders_
+    //  (capped at 20 entries).  Two helpers implement the mechanics:
+    //    trackGTCOrder()        — register a newly placed GTC order.
+    //    maybeCancelGTCOrder()  — purge completed orders then, with the given
+    //                             probability, cancel one random pending order
+    //                             and log ORDER_CANCELLED to QuestDB.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // Register a newly placed GTC LIMIT order so it can be cancelled later.
+    // IOC / MARKET orders are excluded — they self-dispose immediately.
+    void trackGTCOrder(const std::shared_ptr<Order>& order) {
+        if (!order || order->getTimeInForce() == TimeInForce::IOC) return;
+        pendingGTCOrders_.push_back(order);
+        // Hard cap: keep at most 20 candidates to bound memory.
+        if (pendingGTCOrders_.size() > 20)
+            pendingGTCOrders_.erase(pendingGTCOrders_.begin());
+    }
+
+    // Purge orders that are no longer cancellable (FILLED / CANCELLED / EXPIRED),
+    // then cancel one randomly chosen pending GTC order with the given probability.
+    // The cancelled order is immediately logged to QuestDB as ORDER_CANCELLED.
+    void maybeCancelGTCOrder(double probability) {
+        // Step 1 — remove orders that have already been resolved.
+        pendingGTCOrders_.erase(
+            std::remove_if(pendingGTCOrders_.begin(), pendingGTCOrders_.end(),
+                [](const std::shared_ptr<Order>& o) {
+                    if (!o) return true;
+                    const auto s = o->getStatus();
+                    return s == OrderStatus::FILLED   ||
+                           s == OrderStatus::CANCELLED ||
+                           s == OrderStatus::EXPIRED;
+                }),
+            pendingGTCOrders_.end());
+
+        if (pendingGTCOrders_.empty()) return;
+
+        // Step 2 — random gate: skip most iterations so the cancel rate stays
+        //          proportional to the archetype's natural order-placement rate.
+        std::uniform_real_distribution<double> gate(0.0, 1.0);
+        if (gate(engine_) >= probability) return;
+
+        // Step 3 — pick one pending order at random and cancel it.
+        std::uniform_int_distribution<size_t> pick(0, pendingGTCOrders_.size() - 1);
+        auto order = pendingGTCOrders_[pick(engine_)];
+        if (!order) return;
+
+        const auto s = order->getStatus();
+        if (s == OrderStatus::NEW || s == OrderStatus::PARTIALLY_FILLED) {
+            // cancelOrder() acquires the book mutex, removes the order from the
+            // price level map, and calls order->cancel() which stamps the cancel
+            // timestamp and sets status = CANCELLED.
+            orderBook_->cancelOrder(order->getOrderId());
+            // After the call the shared_ptr still points to the same Order object
+            // whose status is now CANCELLED — log it to produce ORDER_CANCELLED
+            // in QuestDB trade_logs.
+            if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
+                logger_->logOrder(*order);
         }
     }
 
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
-        if (isWashTrader_)
-            runWash();
-        else
-            runRetail();
+        if (isWashTrader_) { runWash(); return; }
+        switch (archetype_) {
+            case Archetype::MARKET_MAKER:   runMarketMaker();  break;
+            case Archetype::MOMENTUM:       runMomentum();     break;
+            case Archetype::MEAN_REVERSION: runMeanReversion(); break;
+            default:                        runNoise();        break;
+        }
     }
 
     // ── Members ───────────────────────────────────────────────────────────────
     std::shared_ptr<OrderBook> orderBook_;
     std::string                traderId_;
     bool                       isWashTrader_ = false;
+    Archetype                  archetype_;
     std::atomic<bool>          running_;
     std::thread                thread_;
 
     std::mt19937                           engine_;
-    std::uniform_real_distribution<double> priceDistribution_;
-    std::uniform_int_distribution<size_t>  quantityDistribution_;
-    std::uniform_int_distribution<size_t>  sleepDistribution_;
-    std::uniform_int_distribution<int>     sideDistribution_;
-    std::uniform_real_distribution<double> washPriceJitter_;
+    std::uniform_real_distribution<double> washPriceJitter_; // ±0.1% for wash trades
 
     int instrumentId_;
+
+    // Tracks placed GTC LIMIT orders eligible for future cancellation.
+    // Single-threaded per MockTrader instance — no extra locking required.
+    std::vector<std::shared_ptr<Order>> pendingGTCOrders_;
 };
 
 int MockTrader::mockTraderCount = 0;

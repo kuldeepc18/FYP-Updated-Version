@@ -13,6 +13,8 @@
 #include <fstream>
 #include <csignal>
 #include <cstdlib>
+#include <ctime>    // timegm, sscanf for QuestDB timestamp parsing
+#include <cstring>  // strlen for HTTP request building
 
 // ─── Cross-platform keyboard input (replaces conio.h / windows.h) ────────────
 #ifdef _WIN32
@@ -241,6 +243,24 @@ public:
         }
         // No static price range is set; all prices are determined by real order flow.
         currentInstrumentId_ = 1; // Default to first instrument
+
+        // Restore the last 100 trade records per instrument from QuestDB so
+        // that recentTrades_, the "Recent Trades" display, and the rolling
+        // LTP history used by momentum/mean-reversion traders are all populated
+        // immediately on restart — before the first new trade executes.
+        loadTradeHistoryFromQuestDB();
+
+        // ── Persist LTP source status in Transaction History so it’s always
+        //    visible in the running display (not just at startup) ───────────
+        int ltpCount = InstrumentManager::getInstance().getLTPRestoreCount();
+        if (ltpCount > 0) {
+            addToHistory("[STARTUP] LTP fetched from QuestDB for " +
+                         std::to_string(ltpCount) +
+                         "/15 instruments — LIVE prices active.");
+        } else {
+            addToHistory("[STARTUP] QuestDB had no prior data OR was unreachable —"
+                         " HARDCODED seed prices in use.");
+        }
     }
 
     void start() {
@@ -251,12 +271,23 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (20 per instrument) to generate live order flow ──
+        // ── Start mock traders (200 per instrument) with diverse archetypes ──
+        // Archetype distribution:
+        //   i <  10 → MARKET_MAKER    (10/200,  5%) — continuous two-sided quotes
+        //   i <  60 → MOMENTUM        (50/200, 25%) — trend-following
+        //   i <  80 → MEAN_REVERSION  (20/200, 10%) — bounces/pullbacks
+        //   i < 200 → NOISE           (120/200,60%) — OU-biased retail participants
+        // 15 instruments × 200 traders = 3 000 total mock traders.
         for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
             auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 20; ++i) {
+            for (int i = 0; i < 200; ++i) {
+                MockTrader::Archetype arch;
+                if      (i < 10)  arch = MockTrader::Archetype::MARKET_MAKER;
+                else if (i < 60)  arch = MockTrader::Archetype::MOMENTUM;
+                else if (i < 80)  arch = MockTrader::Archetype::MEAN_REVERSION;
+                else              arch = MockTrader::Archetype::NOISE;
                 mockTraders_.emplace_back(
-                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_));
+                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_, arch));
                 mockTraders_.back()->start();
             }
         }
@@ -515,24 +546,17 @@ private:
         return true;
     }
 
-    // Calculate total unrealized P&L
+    // Calculate total unrealized P&L using true LTP for each instrument
     double calculateTotalUnrealizedPnL() {
         double totalPnL = 0.0;
         std::lock_guard<std::mutex> lock(tradesMutex_);
         for (const auto& trade : userActiveTrades_) {
             if (!trade.isActive) continue;
-            
-            const auto* instrument = InstrumentManager::getInstance().getInstrumentById(trade.instrumentId);
-            if (!instrument) continue;
-            
-            double currentPrice = instrument->marketPrice;
-            double pnl = 0.0;
-            
-            if (trade.side == OrderSide::BUY) {
-                pnl = (currentPrice - trade.entryPrice) * trade.quantity;
-            } else {
-                pnl = (trade.entryPrice - currentPrice) * trade.quantity;
-            }
+            // Use the true Last Traded Price, not the stale Instrument::marketPrice
+            double currentPrice = InstrumentManager::getInstance().getLTP(trade.instrumentId);
+            double pnl = (trade.side == OrderSide::BUY)
+                         ? (currentPrice - trade.entryPrice) * trade.quantity
+                         : (trade.entryPrice - currentPrice) * trade.quantity;
             totalPnL += pnl;
         }
         return totalPnL;
@@ -589,9 +613,9 @@ private:
             return;
         }
         
-        // Get current price and calculate P&L
+        // Use true LTP as the exit price — never the stale Instrument::marketPrice
         const auto* instrument = InstrumentManager::getInstance().getInstrumentById(foundTrade->instrumentId);
-        double currentPrice = instrument ? instrument->marketPrice : 0.0;
+        double currentPrice = InstrumentManager::getInstance().getLTP(foundTrade->instrumentId);
         double pnl = 0.0;
         double pnlPercent = 0.0;
         
@@ -690,9 +714,9 @@ private:
         
         // Process each active trade
         for (auto* trade : activeTrades) {
-            // Get current price (LTP) for the instrument
+            // Use true LTP as exit price for each instrument
+            double currentPrice = InstrumentManager::getInstance().getLTP(trade->instrumentId);
             const auto* instrument = InstrumentManager::getInstance().getInstrumentById(trade->instrumentId);
-            double currentPrice = instrument ? instrument->marketPrice : 0.0;
             double pnl = 0.0;
             double pnlPercent = 0.0;
             
@@ -783,32 +807,36 @@ private:
         size_t quantity;
         std::cin >> quantity;
 
-        double price = 0.0;
+        double      price         = 0.0;
+        double      estimatePrice = 0.0;
+        TimeInForce tif           = TimeInForce::GTC;
+
         if (type == 2) {
+            // LIMIT order: user specifies exact price
             addToHistory("Enter price:");
             std::cin >> price;
+            estimatePrice = price;
         } else {
-            // Market order: set price to current best ask
-            price = orderBooks_[currentInstrumentId_]->getBestAskPrice();
-            if (price == 0.0) {
-                addToHistory("No available ask price for this instrument. Market order cannot be placed.");
-                return;
-            }
+            // MARKET order: walks the entire ask side of the book.
+            // Use best ask as the estimate; fall back to LTP if book is empty.
+            double bestAsk = orderBooks_[currentInstrumentId_]->getBestAskPrice();
+            double ltp     = InstrumentManager::getInstance().getLTP(currentInstrumentId_);
+            estimatePrice  = (bestAsk > 0.0) ? bestAsk : ltp;
+            price          = estimatePrice; // stored on Order for display/refund
+            tif            = TimeInForce::IOC; // unmatched portion dropped immediately
         }
 
-        // Calculate net amount and check balance
-        double netAmount = price * quantity;
-        if (!checkAndPromptBalance(netAmount)) {
-            return;
-        }
+        // Balance check uses estimate (worst-case cost for MARKET)
+        double netAmount = estimatePrice * quantity;
+        if (!checkAndPromptBalance(netAmount)) return;
 
         auto order = std::make_shared<Order>(
             type == 1 ? OrderType::MARKET : OrderType::LIMIT,
             OrderSide::BUY,
             price,
             quantity,
-            TimeInForce::GTC,
-            userId_, // Use actual user ID
+            tif,
+            userId_,
             currentInstrumentId_
         );
 
@@ -816,25 +844,44 @@ private:
         logger_.logOrder(*order);
         userOrders_.push_back(order);
 
-        // Deduct from balance
+        // Deduct estimated cost from balance
         totalBalance_ -= netAmount;
 
-        // Add to active trades for tracking
-        {
+        // For MARKET/IOC orders: refund any unmatched portion immediately.
+        // (IOC orders are never added to the book, so they never expire.)
+        size_t filledQty = quantity - order->getRemainingQuantity();
+        if (type == 1) {
+            if (filledQty == 0) {
+                // No asks available — refund the full estimate
+                totalBalance_ += netAmount;
+                addToHistory("MARKET BUY: No asks available opposite. Order not filled. Balance refunded.");
+                std::cout << "\nPress Enter to return to menu..."; std::cin.ignore(); std::cin.get();
+                return;
+            } else if (order->getRemainingQuantity() > 0) {
+                // Partially filled — refund only the unmatched portion
+                double refund = estimatePrice * order->getRemainingQuantity();
+                totalBalance_ += refund;
+            }
+        }
+
+        size_t activeQty = (type == 1) ? filledQty : quantity;
+        if (activeQty > 0) {
             std::lock_guard<std::mutex> lock(tradesMutex_);
-            userActiveTrades_.emplace_back(order->getOrderId(), currentInstrumentId_, OrderSide::BUY, quantity, price);
+            userActiveTrades_.emplace_back(order->getOrderId(), currentInstrumentId_,
+                                           OrderSide::BUY, activeQty, estimatePrice);
         }
 
         std::stringstream ss;
-        ss << "BUY Order placed - ID: " << order->getOrderId() 
+        ss << "BUY Order placed - ID: " << order->getOrderId()
            << " | Type: " << (type == 1 ? "MARKET" : "LIMIT")
-           << " | Quantity: " << quantity
-           << " | Net Amount: Rs." << std::fixed << std::setprecision(2) << netAmount;
-        if (type == 2) {
+           << " | Quantity: " << quantity;
+        if (type == 1 && filledQty < quantity)
+            ss << " | Filled: " << filledQty << " of " << quantity;
+        ss << " | Net Amount: Rs." << std::fixed << std::setprecision(2) << netAmount;
+        if (type == 2)
             ss << " | Price: Rs." << std::fixed << std::setprecision(2) << price;
-        } else {
-            ss << " | Market Price: Rs." << std::fixed << std::setprecision(2) << price;
-        }
+        else
+            ss << " | Est. Price: Rs." << std::fixed << std::setprecision(2) << estimatePrice;
         addToHistory(ss.str());
     }
 
@@ -849,32 +896,33 @@ private:
         size_t quantity;
         std::cin >> quantity;
 
-        double price = 0.0;
+        double      price         = 0.0;
+        double      estimatePrice = 0.0;
+        TimeInForce tif           = TimeInForce::GTC;
+
         if (type == 2) {
             addToHistory("Enter price:");
             std::cin >> price;
+            estimatePrice = price;
         } else {
-            // Market order: set price to current best bid
-            price = orderBooks_[currentInstrumentId_]->getBestBidPrice();
-            if (price == 0.0) {
-                addToHistory("No available bid price for this instrument. Market order cannot be placed.");
-                return;
-            }
+            // MARKET SELL: walks the entire bid side.
+            double bestBid = orderBooks_[currentInstrumentId_]->getBestBidPrice();
+            double ltp     = InstrumentManager::getInstance().getLTP(currentInstrumentId_);
+            estimatePrice  = (bestBid > 0.0) ? bestBid : ltp;
+            price          = estimatePrice;
+            tif            = TimeInForce::IOC;
         }
 
-        // Calculate net amount and check balance
-        double netAmount = price * quantity;
-        if (!checkAndPromptBalance(netAmount)) {
-            return;
-        }
+        double netAmount = estimatePrice * quantity;
+        if (!checkAndPromptBalance(netAmount)) return;
 
         auto order = std::make_shared<Order>(
             type == 1 ? OrderType::MARKET : OrderType::LIMIT,
             OrderSide::SELL,
             price,
             quantity,
-            TimeInForce::GTC,
-            userId_, // Use actual user ID
+            tif,
+            userId_,
             currentInstrumentId_
         );
 
@@ -882,25 +930,39 @@ private:
         logger_.logOrder(*order);
         userOrders_.push_back(order);
 
-        // Deduct from balance
         totalBalance_ -= netAmount;
 
-        // Add to active trades for tracking
-        {
+        size_t filledQty = quantity - order->getRemainingQuantity();
+        if (type == 1) {
+            if (filledQty == 0) {
+                totalBalance_ += netAmount;
+                addToHistory("MARKET SELL: No bids available opposite. Order not filled. Balance refunded.");
+                std::cout << "\nPress Enter to return to menu..."; std::cin.ignore(); std::cin.get();
+                return;
+            } else if (order->getRemainingQuantity() > 0) {
+                double refund = estimatePrice * order->getRemainingQuantity();
+                totalBalance_ += refund;
+            }
+        }
+
+        size_t activeQty = (type == 1) ? filledQty : quantity;
+        if (activeQty > 0) {
             std::lock_guard<std::mutex> lock(tradesMutex_);
-            userActiveTrades_.emplace_back(order->getOrderId(), currentInstrumentId_, OrderSide::SELL, quantity, price);
+            userActiveTrades_.emplace_back(order->getOrderId(), currentInstrumentId_,
+                                           OrderSide::SELL, activeQty, estimatePrice);
         }
 
         std::stringstream ss;
-        ss << "SELL Order placed - ID: " << order->getOrderId() 
+        ss << "SELL Order placed - ID: " << order->getOrderId()
            << " | Type: " << (type == 1 ? "MARKET" : "LIMIT")
-           << " | Quantity: " << quantity
-           << " | Net Amount: Rs." << std::fixed << std::setprecision(2) << netAmount;
-        if (type == 2) {
+           << " | Quantity: " << quantity;
+        if (type == 1 && filledQty < quantity)
+            ss << " | Filled: " << filledQty << " of " << quantity;
+        ss << " | Net Amount: Rs." << std::fixed << std::setprecision(2) << netAmount;
+        if (type == 2)
             ss << " | Price: Rs." << std::fixed << std::setprecision(2) << price;
-        } else {
-            ss << " | Market Price: Rs." << std::fixed << std::setprecision(2) << price;
-        }
+        else
+            ss << " | Est. Price: Rs." << std::fixed << std::setprecision(2) << estimatePrice;
         addToHistory(ss.str());
     }
 
@@ -1055,48 +1117,237 @@ private:
         }
     }
 
+    // ── Trade history restoration from QuestDB ─────────────────────────────────
+    // Queries QuestDB REST API (port 9000) for the last 1 500 TRADE_MATCH rows
+    // (15 instruments × up to 100 each).  For each instrument, constructs Trade
+    // objects from the stored columns and injects them into the corresponding
+    // OrderBook via restoreTradeHistory().
+    //
+    // Columns fetched:
+    //   instrument_id  ─ SYMBOL    e.g. "1"
+    //   price          ─ DOUBLE    e.g. 1582.15
+    //   quantity       ─ LONG      e.g. 100
+    //   buyer_user_id  ─ SYMBOL    e.g. "9"
+    //   seller_user_id ─ SYMBOL    e.g. "119"
+    //   aggressor_side ─ SYMBOL    "BUY" | "SELL"
+    //   timestamp      ─ TIMESTAMP e.g. "2026-03-11T12:51:47.123456Z"
+    //
+    // Falls back silently if QuestDB is unreachable, the response is malformed,
+    // or the table has no TRADE_MATCH rows yet.
+    void loadTradeHistoryFromQuestDB() {
+        // ── Open socket to QuestDB HTTP API ──────────────────────────────────
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            std::printf("[Startup] Trade history restore: socket() failed\n");
+            std::fflush(stdout);
+            return;
+        }
+        struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
+        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(9000);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(sock);
+            std::printf("[Startup] Trade history restore: QuestDB not reachable — trade history starts empty.\n");
+            std::fflush(stdout);
+            return;
+        }
+
+        // ── HTTP GET request ─────────────────────────────────────────────────
+        // SQL (URL-encoded):
+        //   SELECT instrument_id,price,quantity,buyer_user_id,seller_user_id,
+        //          aggressor_side,timestamp
+        //   FROM trade_logs
+        //   WHERE order_status_event='TRADE_MATCH'
+        //   ORDER BY timestamp DESC LIMIT 1500
+        const char* req =
+            "GET /exec?query=SELECT%20instrument_id%2Cprice%2Cquantity"
+            "%2Cbuyer_user_id%2Cseller_user_id%2Caggressor_side%2Ctimestamp"
+            "%20FROM%20trade_logs"
+            "%20WHERE%20order_status_event%3D%27TRADE_MATCH%27"
+            "%20ORDER%20BY%20timestamp%20DESC%20LIMIT%201500"
+            " HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+        ::send(sock, req, std::strlen(req), 0);
+
+        // ── Read full response in chunks until connection closes ──────────────
+        std::string response;
+        char recvBuf[4096];
+        int  n;
+        while ((n = ::recv(sock, recvBuf, sizeof(recvBuf) - 1, 0)) > 0) {
+            recvBuf[n] = '\0';
+            response  += recvBuf;
+        }
+        ::close(sock);
+
+        if (response.empty()) {
+            std::printf("[Startup] Trade history restore: empty response from QuestDB.\n"); std::fflush(stdout);
+            return;
+        }
+
+        // ── Locate JSON dataset array ─────────────────────────────────────────
+        auto ds = response.find("\"dataset\":[");
+        if (ds == std::string::npos) {
+            std::printf("[Startup] Trade history restore: no TRADE_MATCH rows in QuestDB yet.\n"); std::fflush(stdout);
+            return;
+        }
+        size_t pos = ds + 11;
+
+        // ── JSON parsing helpers (lambdas) ──────────────────────────────────
+        auto skipWs = [&]() {
+            while (pos < response.size() &&
+                   (response[pos]==' '||response[pos]=='\n'||
+                    response[pos]=='\r'||response[pos]=='\t'))
+                ++pos;
+        };
+        // Read a JSON quoted string. Returns content between the quotes.
+        auto readQStr = [&]() -> std::string {
+            if (pos >= response.size() || response[pos] != '"') return "";
+            ++pos;
+            std::string s;
+            while (pos < response.size() && response[pos] != '"') {
+                if (response[pos] == '\\' && pos + 1 < response.size()) ++pos; // escape
+                s += response[pos++];
+            }
+            if (pos < response.size()) ++pos; // closing quote
+            return s;
+        };
+        // Read a JSON number or keyword (null, true, false) as a raw string.
+        auto readRaw = [&]() -> std::string {
+            std::string s;
+            while (pos < response.size() &&
+                   response[pos] != ',' && response[pos] != ']' &&
+                   response[pos] != ' ' && response[pos] != '\n')
+                s += response[pos++];
+            return s;
+        };
+        // Read one JSON token (string or raw).
+        auto readToken = [&]() -> std::string {
+            skipWs();
+            return (pos < response.size() && response[pos] == '"')
+                   ? readQStr() : readRaw();
+        };
+        // Skip separator (comma or nothing) after a token.
+        auto skipSep = [&]() {
+            skipWs();
+            if (pos < response.size() && response[pos] == ',') ++pos;
+        };
+
+        // ── Parse each row array in the dataset ──────────────────────────────
+        // Group parsed Trade objects by instrument_id (newest-first from query).
+        std::map<int, std::vector<Trade>> byInstrument;
+
+        while (pos < response.size()) {
+            skipWs();
+            if (pos < response.size() && response[pos] == ',') { ++pos; continue; }
+            if (pos >= response.size() || response[pos] == ']') break;
+            if (response[pos] != '[')                           { ++pos; continue; }
+            ++pos; // skip opening '['
+
+            // Column 0: instrument_id (SYMBOL → quoted string)
+            std::string col0 = readToken(); skipSep();
+            // Column 1: price (DOUBLE → number)
+            std::string col1 = readToken(); skipSep();
+            // Column 2: quantity (LONG → number)
+            std::string col2 = readToken(); skipSep();
+            // Column 3: buyer_user_id (SYMBOL → quoted string)
+            std::string col3 = readToken(); skipSep();
+            // Column 4: seller_user_id (SYMBOL → quoted string)
+            std::string col4 = readToken(); skipSep();
+            // Column 5: aggressor_side (SYMBOL → quoted string)
+            std::string col5 = readToken(); skipSep();
+            // Column 6: timestamp (TIMESTAMP → quoted ISO string)
+            std::string col6 = readToken();
+
+            // Skip to the closing ']' of this row
+            while (pos < response.size() && response[pos] != ']') ++pos;
+            if (pos < response.size()) ++pos;
+
+            // ── Parse column values ──────────────────────────────────────────
+            int    instrId = 0;
+            double price   = 0.0;
+            size_t qty     = 0;
+            try { instrId = std::stoi(col0); }   catch (...) { continue; }
+            try { price   = std::stod(col1); }   catch (...) { continue; }
+            try { qty     = static_cast<size_t>(std::stoull(col2)); } catch (...) { qty = 0; }
+
+            if (instrId < 1 || instrId > 15 || price <= 0.0) continue;
+            // Each instrument capped at 100 entries in recentTrades_
+            if (byInstrument[instrId].size() >= 100) continue;
+
+            // ── Parse ISO 8601 UTC timestamp ──────────────────────────────────
+            // Format: "2026-03-11T12:51:47.123456Z"
+            // Uses timegm() (POSIX, Linux) to interpret the struct tm as UTC.
+            auto tp = std::chrono::system_clock::now(); // fallback
+            if (col6.size() >= 19) {
+                int yr=0,mo=0,dy=0,hr=0,mn=0,sc=0;
+                if (std::sscanf(col6.c_str(), "%d-%d-%dT%d:%d:%d",
+                                &yr,&mo,&dy,&hr,&mn,&sc) == 6 && yr > 1970) {
+                    std::tm tmv = {};
+                    tmv.tm_year = yr - 1900;
+                    tmv.tm_mon  = mo  - 1;
+                    tmv.tm_mday = dy;
+                    tmv.tm_hour = hr;
+                    tmv.tm_min  = mn;
+                    tmv.tm_sec  = sc;
+                    tmv.tm_isdst = 0;
+                    time_t t = timegm(&tmv);
+                    if (t != static_cast<time_t>(-1))
+                        tp = std::chrono::system_clock::from_time_t(t);
+                }
+            }
+
+            OrderSide aggr = (col5 == "BUY") ? OrderSide::BUY : OrderSide::SELL;
+
+            // Construct Trade. buyOrderId/sellOrderId are labelled RESTORED
+            // because only the buy_order_id was stored in QuestDB tags.
+            // These fields are cosmetic (display only) — not used in matching.
+            byInstrument[instrId].emplace_back(
+                "RESTORED",                          // buyOrderId  (display only)
+                "RESTORED",                          // sellOrderId (display only)
+                price, qty, tp,
+                col3.empty() ? "NA" : col3,          // buyerUserId
+                col4.empty() ? "NA" : col4,          // sellerUserId
+                aggr, instrId);
+        }
+
+        // ── Inject into OrderBooks ─────────────────────────────────────────────
+        // byInstrument[id] is newest→oldest (ORDER BY timestamp DESC).
+        // Reverse to oldest→newest to match the order used during live trading
+        // (executeTrade appends to recentTrades_ in chronological order).
+        int count = 0;
+        for (auto& [instrId, trades] : byInstrument) {
+            if (trades.empty()) continue;
+            std::reverse(trades.begin(), trades.end());
+            auto obIt = orderBooks_.find(instrId);
+            if (obIt != orderBooks_.end()) {
+                obIt->second->restoreTradeHistory(std::move(trades));
+                ++count;
+            }
+        }
+        std::printf("[Startup] Trade history restored: %d/15 instruments from QuestDB.\n", count);
+        std::fflush(stdout);
+    }
+
     void displayMarketData() {
         while (running_) {
             // Move cursor to top-left and clear screen with ANSI codes
             // (avoids the flash/black-screen that system("clear") causes)
             printf("\033[2J\033[H");
             fflush(stdout);
-            // Update all instruments' market prices in real time
-            for (auto& instrument : const_cast<std::vector<Instrument>&>(InstrumentManager::getInstance().getInstruments())) {
-                auto it = orderBooks_.find(instrument.instrumentId);
-                if (it != orderBooks_.end()) {
-                    auto orderBook = it->second;
-                    double bestBid = orderBook->getBestBidPrice();
-                    double bestAsk = orderBook->getBestAskPrice();
-                    double price = 0.0;
-                    if (bestBid > 0.0 && bestAsk > 0.0) {
-                        price = (bestBid + bestAsk) / 2.0;
-                    } else if (bestBid > 0.0) {
-                        price = bestBid;
-                    } else if (bestAsk > 0.0) {
-                        price = bestAsk;
-                    } else {
-                        price = instrument.marketPrice;
-                    }
-                    instrument.marketPrice = price;
-                }
-            }
 
+            // LTP is the authoritative market price — updated on every matched
+            // trade by OrderBook::executeTrade() → InstrumentManager::setLTP().
+            // No const_cast or direct writes to Instrument::marketPrice needed.
             const auto* currentInstrument = InstrumentManager::getInstance().getInstrumentById(currentInstrumentId_);
             auto currentOrderBook = orderBooks_[currentInstrumentId_];
-            double bestBid = currentOrderBook->getBestBidPrice();
-            double bestAsk = currentOrderBook->getBestAskPrice();
-            double marketPrice = 0.0;
-            if (bestBid > 0.0 && bestAsk > 0.0) {
-                marketPrice = (bestBid + bestAsk) / 2.0;
-            } else if (bestBid > 0.0) {
-                marketPrice = bestBid;
-            } else if (bestAsk > 0.0) {
-                marketPrice = bestAsk;
-            } else {
-                marketPrice = currentInstrument->marketPrice;
-            }
-            const_cast<Instrument*>(currentInstrument)->marketPrice = marketPrice;
+            double bestBid    = currentOrderBook->getBestBidPrice();
+            double bestAsk    = currentOrderBook->getBestAskPrice();
+            double marketPrice = InstrumentManager::getInstance().getLTP(currentInstrumentId_);
 
             // Display User Info Section
             double unrealizedPnL = calculateTotalUnrealizedPnL();
@@ -1144,7 +1395,7 @@ private:
             std::cout << "| Instrument Name           | Symbol         | Current Price   |\n";
             std::cout << "+------------------------------------------+\n";
             for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
-                double price = instrument.marketPrice;
+                double price = InstrumentManager::getInstance().getLTP(instrument.instrumentId);
                 std::cout << "| " << std::left << std::setw(25) << instrument.name
                           << "| " << std::setw(13) << instrument.symbol
                           << "| â‚¹" << std::fixed << std::setprecision(2) << std::setw(14) << price << "|\n";
@@ -1211,7 +1462,8 @@ private:
             const auto* instrument = InstrumentManager::getInstance().getInstrumentById(trade.instrumentId);
             if (!instrument) continue;
             
-            double currentPrice = instrument->marketPrice;
+            // Always use true LTP for live P&L — NOT the stale Instrument::marketPrice
+            double currentPrice = InstrumentManager::getInstance().getLTP(trade.instrumentId);
             double pnl = 0.0;
             double pnlPercent = 0.0;
             
@@ -1390,7 +1642,7 @@ private:
             }
 
             std::stringstream ss;
-            ss << "Order EXPIRED (5 s unfilled) - ID: " << oid
+            ss << "Order EXPIRED (120 s unfilled) - ID: " << oid
                << " | Refunded: Rs."
                << std::fixed << std::setprecision(2) << refund;
             addToHistory(ss.str());
@@ -1434,7 +1686,9 @@ private:
 
         std::ostringstream j;
         j << std::fixed << std::setprecision(2);
-        j << "{\"bids\":[";
+        // Include true LTP so the frontend never needs to derive price from bid/ask
+        double ltp = InstrumentManager::getInstance().getLTP(instrId);
+        j << "{\"ltp\":" << ltp << ",\"bids\":[";
         int cnt = 0;
         for (auto li = buyLevels.begin(); li != buyLevels.end() && cnt < 5; ++li, ++cnt) {
             if (cnt) j << ",";
@@ -1537,6 +1791,16 @@ int main() {
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGHUP,  &sa, nullptr);
+
+#ifndef _WIN32
+    // ── CRITICAL: Ignore SIGPIPE process-wide ────────────────────────────────
+    // Without this, any ::send() on a closed QuestDB ILP socket (port 9009)
+    // raises SIGPIPE and KILLS THE ENTIRE ENGINE SILENTLY.  Once dead, the
+    // engine records no further trades in QuestDB.  The user then reruns the
+    // backend and wonders why the table is empty.  With SIG_IGN the broken
+    // send() returns -1/EPIPE and Logger::sendILP() reconnects automatically.
+    ::signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Write PID file so run.sh / stop scripts can reliably find this process.
     writePidFile();

@@ -14,7 +14,10 @@
 #include "Logger.hpp"
 
 // Orders expire if still pending (NEW or PARTIAL) after this many seconds.
-static constexpr int ORDER_EXPIRY_SECONDS = 5;
+// 120 s gives resting limit orders enough life to find a counterparty while
+// still keeping the book fresh. Unfilled orders at extreme prices expire and
+// are swept cleanly — realistic for a liquid intraday market.
+static constexpr int ORDER_EXPIRY_SECONDS = 120;
 
 class OrderBook {
 public:
@@ -71,6 +74,23 @@ public:
         return recentTrades_;
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    //  restoreTradeHistory()  ─  called once at startup by TradingApplication
+    //  ──────────────────────────────────────────────────────────────────────
+    //  Populates recentTrades_ from records retrieved from QuestDB so the
+    //  in-memory trade history is non-empty the instant the engine restarts.
+    //  Thread-safe: acquires mutex_ (shared with expiry thread).
+    //  Enforces the same 100-entry rolling cap used during live trading.
+    // ──────────────────────────────────────────────────────────────────────
+    void restoreTradeHistory(std::vector<Trade> trades) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        recentTrades_ = std::move(trades);
+        // Trim to the same 100-entry cap enforced during live trading
+        if (recentTrades_.size() > 100)
+            recentTrades_.erase(recentTrades_.begin(),
+                                recentTrades_.end() - 100);
+    }
+
     double getBestBidPrice() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return buyLevels_.empty() ? 0.0 : buyLevels_.rbegin()->first;
@@ -98,9 +118,14 @@ private:
             auto bestPrice = (incomingOrder->getSide() == OrderSide::BUY) ?
                              oppositeSide.begin()->first : oppositeSide.rbegin()->first;
 
-            if ((incomingOrder->getSide() == OrderSide::BUY  && bestPrice > incomingOrder->getPrice()) ||
-                (incomingOrder->getSide() == OrderSide::SELL && bestPrice < incomingOrder->getPrice()))
-                break;
+            // MARKET orders match at ANY available price — they walk the full book.
+            // LIMIT orders stop when the best opposite price no longer satisfies
+            // their limit (standard price-time priority matching semantics).
+            if (incomingOrder->getType() != OrderType::MARKET) {
+                if ((incomingOrder->getSide() == OrderSide::BUY  && bestPrice > incomingOrder->getPrice()) ||
+                    (incomingOrder->getSide() == OrderSide::SELL && bestPrice < incomingOrder->getPrice()))
+                    break;
+            }
 
             auto priceLevel = (incomingOrder->getSide() == OrderSide::BUY) ?
                               oppositeSide.begin()->second : oppositeSide.rbegin()->second;
@@ -196,6 +221,12 @@ private:
             // Log the matched TRADE_MATCH row — primary row for ML graph analysis.
             logger_->logTrade(trade);
         }
+
+        // ── Update the true Last Traded Price with the actual execution price ──
+        // This is the ONLY authoritative source of LTP — it fires at the exact
+        // instant every trade matches, not periodically from the display thread.
+        // All mock traders and PnL calculations read from this via getLTP().
+        InstrumentManager::getInstance().setLTP(incomingOrder->getInstrumentId(), price);
     }
 
     // ── Expiry: scan all pending orders and expire those older than ORDER_EXPIRY_SECONDS ──

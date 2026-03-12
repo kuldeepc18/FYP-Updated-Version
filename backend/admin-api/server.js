@@ -58,10 +58,15 @@ function writeUserOrders(orders) {
   fs.writeFileSync(USER_ORDERS_FILE, JSON.stringify(orders, null, 2), 'utf8');
 }
 
-// Compute net open positions for a user from their FILLED orders
-function computeUserPositions(userId, priceMap) {
-  const orders = readUserOrders().filter(
-    o => o.userId === userId && o.status === 'FILLED' && o.filledQuantity > 0
+// Compute net open positions for a user from their FILLED orders.
+// allOrdersOverride: when supplied (e.g. from the in-memory loop array), use
+// that instead of re-reading the file — prevents a one-tick stale read that
+// caused auto square-offs to fire repeatedly into an infinite chain.
+function computeUserPositions(userId, priceMap, allOrdersOverride = null) {
+  const orders = (allOrdersOverride !== null ? allOrdersOverride : readUserOrders()).filter(
+    o => o.userId === userId &&
+         (o.status === 'FILLED' || (o.status === 'PARTIAL' && o.filledQuantity > 0)) &&
+         o.filledQuantity > 0
   );
   const posMap = {};
   orders.forEach(o => {
@@ -89,6 +94,85 @@ function computeUserPositions(userId, priceMap) {
     const unrealizedPnlPercent = avgPrice > 0 ? (unrealizedPnl / (avgPrice * absQty)) * 100 : 0;
     return { symbol: pos.symbol, name: pos.name, quantity: absQty, side, averagePrice: avgPrice, currentPrice, unrealizedPnl, unrealizedPnlPercent, timestamp: Date.now() };
   }).filter(Boolean);
+}
+
+// ─── FIFO open-position order resolver ───────────────────────────────────────
+//
+// Returns the filled orders that constitute the CURRENT (not yet squared-off)
+// open position for a user+symbol by FIFO-matching buys against sells.
+//
+// Why this matters: if a user previously had a position with T/SL (which was
+// then exited), and later opens a NEW position for the same symbol without
+// setting any T/SL, the old order's T/SL must NOT fire on the new position.
+// Using FIFO matching guarantees that only orders whose filled quantity has NOT
+// yet been matched by a subsequent opposite-side fill are considered "open".
+//
+// Returns: { side: 'BUY' | 'SELL' | null, openOrders: Order[] }
+//   openOrders — the actual Order objects that still have unmatched open qty.
+//   A T/SL should only be sourced from these orders.
+function getOpenPositionOrders(userId, symbol, allOrders) {
+  // Sort chronologically (oldest first) so FIFO matching is correct.
+  const filled = allOrders.filter(
+    o => o.userId === userId && o.symbol === symbol &&
+         (o.status === 'FILLED' || (o.status === 'PARTIAL' && o.filledQuantity > 0)) &&
+         o.filledQuantity > 0
+  ).sort((a, b) => (a.fillTimestamp || a.timestamp) - (b.fillTimestamp || b.timestamp));
+
+  const openBuys  = []; // [{ order, remainingQty }]
+  const openSells = []; // [{ order, remainingQty }]
+
+  for (const o of filled) {
+    let rem = o.filledQuantity;
+    if (o.side === 'BUY') {
+      // A buy first closes any existing short, then opens a long.
+      while (rem > 0.0001 && openSells.length > 0) {
+        const oldest  = openSells[0];
+        const matched = Math.min(oldest.remainingQty, rem);
+        oldest.remainingQty -= matched;
+        rem -= matched;
+        if (oldest.remainingQty <= 0.0001) openSells.shift();
+      }
+      if (rem > 0.0001) openBuys.push({ order: o, remainingQty: rem });
+    } else {
+      // A sell first closes any existing long, then opens a short.
+      while (rem > 0.0001 && openBuys.length > 0) {
+        const oldest  = openBuys[0];
+        const matched = Math.min(oldest.remainingQty, rem);
+        oldest.remainingQty -= matched;
+        rem -= matched;
+        if (oldest.remainingQty <= 0.0001) openBuys.shift();
+      }
+      if (rem > 0.0001) openSells.push({ order: o, remainingQty: rem });
+    }
+  }
+
+  if (openBuys.length  > 0) return { side: 'BUY',  openOrders: openBuys.map(e  => e.order) };
+  if (openSells.length > 0) return { side: 'SELL', openOrders: openSells.map(e => e.order) };
+  return { side: null, openOrders: [] };
+}
+
+// ── Partial-fill helpers ──────────────────────────────────────────────────────
+//
+// requiresPartialFill — returns true when this order's total quantity is large
+// enough (relative to the instrument's LTP) that it should be executed gradually
+// over several 1-second matching-loop ticks, simulating real market liquidity.
+//
+// Threshold matrix:
+//   LTP < 1 000             →  partial when qty ≥ 1 000
+//   1 000 ≤ LTP ≤ 10 000   →  partial when qty ≥ 1 000
+//   10 000 < LTP ≤ 20 000  →  partial when qty ≥   500
+//   LTP > 20 000            →  partial when qty ≥   100
+function requiresPartialFill(orderQty, ltp) {
+  if (ltp > 20000) return orderQty >= 100;
+  if (ltp > 10000) return orderQty >= 500;   // DIXON range: 10 000 < ltp ≤ 20 000
+  return orderQty >= 1000;                   // covers both < 1 000 and 1 000–10 000
+}
+
+// partialChunkQty — fills 5–20 % of remaining quantity per loop tick so that
+// large orders complete in roughly 5–30 seconds, mimicking real market absorption.
+function partialChunkQty(remainingQty) {
+  const pct = 0.05 + Math.random() * 0.15;  // 5 %–20 % per tick
+  return Math.max(1, Math.min(remainingQty, Math.floor(remainingQty * pct)));
 }
 
 const app = express();
@@ -126,13 +210,38 @@ function getMarketPhase() {
 }
 
 // ─── Device Hash Helper ──────────────────────────────────────────────────────
-// Produces a stable, per-user device_id_hash. Same user → same hash always.
-// Different users → different hashes. Uses HMAC-SHA256 keyed on a fixed secret.
+// Produces a stable, per-user device_id_hash using FNV-1a (identical algorithm
+// to the C++ engine's computeDeviceIdHash in Order.hpp). Same user → same hash.
+// Output: 8 uppercase hex chars (e.g. "A3F2B1C0") — matches mock-trader format.
 function getUserDeviceHash(userId) {
-  return crypto.createHmac('sha256', 'ktrade_device_secret_2026')
-    .update(String(userId))
-    .digest('hex')
-    .slice(0, 32);
+  let hash = 2166136261; // FNV-1a 32-bit offset basis
+  const str = String(userId);
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0; // FNV prime, unsigned 32-bit
+  }
+  return ('00000000' + hash.toString(16).toUpperCase()).slice(-8);
+}
+
+// Generate user order ID matching the C++ engine format:
+//   instrumentId-random10digits-userId
+// split_part(order_id, '-', 1) returns instrumentId — backward-compatible with
+// all existing QuestDB queries that rely on this positional split.
+function generateUserOrderId(instrumentId, userId) {
+  const rand10 = String(Math.floor(1000000000 + Math.random() * 9000000000));
+  return `${instrumentId}-${rand10}-${userId}`;
+}
+
+// Generate trade ID matching the C++ Trade.hpp format: TRD-instrId-rand10
+function generateTradeId(instrumentId) {
+  const rand10 = String(Math.floor(1000000000 + Math.random() * 9000000000));
+  return `TRD-${instrumentId}-${rand10}`;
+}
+
+// Returns a random mock trader ID (1–9 999) as the simulated counterparty for
+// paper-trade fills.  In real markets this would be the resting order's owner.
+function pickMockCounterparty() {
+  return String(Math.floor(1 + Math.random() * 9999));
 }
 
 // ─── QuestDB ILP writer — persists a single user order event ─────────────────
@@ -160,32 +269,47 @@ async function writeUserTradeToQuestDB(order, fillPrice, filledQty, statusEvent,
     const nowMs        = Date.now();
     const tsNs         = BigInt(nowMs) * 1_000_000n; // ms → nanoseconds for ILP
 
-    // order_id: embed instrument_id so split_part(order_id,'-',1) works.
-    // Sanitise the UUID (remove hyphens) to avoid ambiguity in split_part.
-    const sanitisedUuid = String(order.id || nowMs).replace(/-/g, '');
-    const questOrderId  = `${instrumentId}-${sanitisedUuid}`;
+    // order_id: use the order's own ID directly.
+    // New format: instrumentId-rand10digits-userId — split_part(order_id,'-',1) = instrumentId. ✓
+    const questOrderId  = order.id || `${instrumentId}-${nowMs}-${order.userId}`;
 
     const deviceIdHash  = getUserDeviceHash(order.userId);
     const marketPhase   = getMarketPhase();
 
-    // Fill / trade context (only meaningful for FILLED / PARTIAL)
-    const tradeId       = opts.tradeId       || 'NA';
-    const buyerUserId   = opts.buyerUserId   || (order.side === 'BUY'  ? String(order.userId) : 'NA');
-    const sellerUserId  = opts.sellerUserId  || (order.side === 'SELL' ? String(order.userId) : 'NA');
-    const aggressorSide = opts.aggressorSide || (filledQty > 0 ? order.side : 'NA');
+    // Fill / trade context
+    // For ORDER_NEW / CANCELLED / EXPIRED (no fill): all NA (no match occurred).
+    // For ORDER_PARTIAL / ORDER_FILLED with qty > 0: real trade_id + counterparty IDs,
+    // exactly as the C++ engine writes for TRADE_MATCH rows.
+    const isFillEvent  = (statusEvent === 'ORDER_PARTIAL' || statusEvent === 'ORDER_FILLED') && filledQty > 0;
+    const tradeId      = opts.tradeId      || (isFillEvent ? generateTradeId(instrumentId) : 'NA');
+    const counterparty = isFillEvent ? pickMockCounterparty() : 'NA';
+    // buyer/seller: the user IS the buyer for BUY orders and IS the seller for SELL orders;
+    // the counterparty (a mock trader) is on the opposite side.
+    const buyerUserId  = opts.buyerUserId  ||
+      (isFillEvent ? (order.side === 'BUY'  ? String(order.userId) : counterparty) : 'NA');
+    const sellerUserId = opts.sellerUserId ||
+      (isFillEvent ? (order.side === 'SELL' ? String(order.userId) : counterparty) : 'NA');
+    const aggressorSide = opts.aggressorSide || (isFillEvent ? order.side : 'NA');
 
     const remainingQty  = Math.max(0, (order.quantity || 0) - filledQty);
-    const submitTs      = order.timestamp    || nowMs;
-    const cancelTs      = opts.cancelTimestamp || 0;
+    // Timestamps in MICROSECONDS — matching the C++ engine's convention (Logger.hpp).
+    // JavaScript's Date.now() returns milliseconds; multiply × 1 000 to get µs.
+    const submitTsUs   = (order.timestamp || nowMs) * 1000;
+    const cancelTsUs   = opts.cancelTimestamp ? opts.cancelTimestamp * 1000 : 0;
+    const matchTsUs    = nowMs * 1000; // match_engine_timestamp in µs
 
-    // is_short_sell: TRUE for SELL orders that are not closing an existing long.
-    // The backend tracks this via the isPositionExit flag set on auto-exit orders.
-    const isShortSell   = order.side === 'SELL' && !(order.isAutoOrder && order.autoReason === 'USER_EXIT');
+    // is_short_sell: TRUE for SELL orders that are NOT closing an existing position.
+    // Any auto-exit order (T/SL or manual) is always a position close, never a short.
+    const isShortSell  = order.side === 'SELL' && !(order.isAutoOrder &&
+      (order.autoReason === 'USER_EXIT' || order.autoReason === 'USER_EXIT_ALL' ||
+       order.autoReason === 'TARGET'    || order.autoReason === 'SL'));
 
     // ILP tag values must escape spaces (→ '\ '), commas (→ '\,'), '=' (→ '\=')
     const esc = s => String(s).replace(/,/g, '\\,').replace(/=/g, '\\=').replace(/ /g, '\\ ');
 
     // Build ILP line:  table,tags fields timestamp_ns
+    // trader_type / buyer_trader_type / seller_trader_type = NORMAL for all real users
+    // (mock traders have their own type stored in the C++ engine rows).
     const line =
       `trade_logs` +
       `,order_id=${esc(questOrderId)}` +
@@ -200,13 +324,17 @@ async function writeUserTradeToQuestDB(order, fillPrice, filledQty, statusEvent,
       `,aggressor_side=${esc(aggressorSide)}` +
       `,market_phase=${esc(marketPhase)}` +
       `,device_id_hash=${esc(deviceIdHash)}` +
+      `,trader_type=NORMAL` +
+      `,buyer_trader_type=NORMAL` +
+      `,seller_trader_type=NORMAL` +
       ` price=${Number(fillPrice)}` +
       `,quantity=${order.quantity || 0}i` +
       `,filled_quantity=${filledQty}i` +
       `,remaining_quantity=${remainingQty}i` +
       `,is_short_sell=${isShortSell}` +
-      `,order_submit_timestamp=${submitTs}i` +
-      `,order_cancel_timestamp=${cancelTs}i` +
+      `,order_submit_timestamp=${submitTsUs}i` +
+      `,order_cancel_timestamp=${cancelTsUs}i` +
+      `,match_engine_timestamp=${matchTsUs}i` +
       ` ${tsNs}\n`;
 
     await axios.post(QUESTDB_ILP, line, {
@@ -669,8 +797,9 @@ app.post('/api/user/orders', requireUserAuth, async (req, res) => {
     if (idx !== -1) { users[idx].balance -= requiredFunds; writeUsers(users); }
   }
 
+  const instId = instEntry ? instEntry.id : '0';
   const order = {
-    id            : crypto.randomUUID(),
+    id            : generateUserOrderId(instId, userId),
     userId,
     symbol,
     name          : instEntry?.name || symbol,
@@ -693,6 +822,12 @@ app.post('/api/user/orders', requireUserAuth, async (req, res) => {
     // LTP captured at the moment this order was placed — used by the matching
     // loop to determine fill direction (must market rise or fall to reach limit?).
     placedAtPrice : placedAtPrice,
+    // Pre-computed absolute expiry timestamp (ms).  MARKET orders fill instantly
+    // so they carry null.  Non-MARKET orders expire after 120 s (INTRADAY) or
+    // 24 h (OVERNIGHT) — whichever comes first relative to this moment.
+    expiresAt     : orderType === 'MARKET'
+      ? null
+      : Date.now() + ((validity || 'INTRADAY') === 'INTRADAY' ? 120_000 : 24 * 60 * 60 * 1000),
   };
   const orders = readUserOrders();
   orders.unshift(order);
@@ -808,6 +943,9 @@ app.get('/api/user/orders', requireUserAuth, (req, res) => {
       fillTimestamp  : o.fillTimestamp,
       isAutoOrder    : o.isAutoOrder,
       autoReason     : o.autoReason,
+      expiresAt      : o.expiresAt  || null,
+      cancelledAt    : o.cancelledAt || null,
+      expiredAt      : o.expiredAt  || null,
     }));
   res.json(orders);
 });
@@ -846,8 +984,23 @@ app.get('/api/user/positions', requireUserAuth, async (req, res) => {
     try { quotes = await fetchMarketQuotes(); } catch {}
     const priceMap = {};
     quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
-    const positions = computeUserPositions(userId, priceMap);
-    res.json(positions);
+    const allOrders = readUserOrders();
+    const positions = computeUserPositions(userId, priceMap, allOrders);
+    // Enrich each position with the active target price and stop loss from the
+    // current open orders (same FIFO logic as the matching loop uses for triggers).
+    const enriched = positions.map(pos => {
+      const { openOrders } = getOpenPositionOrders(userId, pos.symbol, allOrders);
+      const nonAutoOpen    = openOrders.filter(o => !o.isAutoOrder);
+      const newestFirst    = [...nonAutoOpen].reverse();
+      const withTarget     = newestFirst.find(o => o.targetPrice != null && o.targetPrice > 0);
+      const withSL         = newestFirst.find(o => o.stopLoss    != null && o.stopLoss    > 0);
+      return {
+        ...pos,
+        targetPrice: withTarget?.targetPrice ?? null,
+        stopLoss   : withSL?.stopLoss        ?? null,
+      };
+    });
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -866,6 +1019,20 @@ app.post('/api/user/positions/exit', requireUserAuth, async (req, res) => {
     const positions = computeUserPositions(userId, priceMap);
     const pos = positions.find(p => p.symbol === symbol);
     if (!pos) return res.status(404).json({ error: 'No open position for this symbol' });
+
+    // Guard: reject if an exit auto-order is already pending for this symbol.
+    // Without this, a T/SL auto-exit that fired a moment ago (still PENDING)
+    // plus a simultaneous manual Exit click would create TWO exit orders and
+    // result in an erroneous reverse position (net qty goes negative).
+    const allOrders = readUserOrders();
+    const hasPendingExit = allOrders.some(
+      o => o.userId === userId && o.symbol === symbol &&
+           o.isAutoOrder && (o.status === 'PENDING' || o.status === 'PARTIAL')
+    );
+    if (hasPendingExit) {
+      return res.status(409).json({ error: 'An exit order is already pending for this symbol. It will fill within seconds.' });
+    }
+
     const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
     const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === symbol);
     const currentPrice = priceMap[symbol] || pos.averagePrice;
@@ -882,7 +1049,7 @@ app.post('/api/user/positions/exit', requireUserAuth, async (req, res) => {
       if (uidx !== -1) { users[uidx].balance -= requiredFunds; writeUsers(users); }
     }
     const order = {
-      id            : crypto.randomUUID(),
+      id            : generateUserOrderId(instEntry ? instEntry.id : '0', userId),
       userId,
       symbol,
       name          : instEntry?.name || pos.name || symbol,
@@ -904,9 +1071,8 @@ app.post('/api/user/positions/exit', requireUserAuth, async (req, res) => {
       isAutoOrder   : true,
       autoReason    : 'USER_EXIT',
     };
-    const orders = readUserOrders();
-    orders.unshift(order);
-    writeUserOrders(orders);
+    allOrders.unshift(order);
+    writeUserOrders(allOrders);
     res.json({ ok: true, orderId: order.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -923,9 +1089,18 @@ app.post('/api/user/positions/exit-all', requireUserAuth, async (req, res) => {
     quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
     const positions = computeUserPositions(userId, priceMap);
     if (!positions.length) return res.json({ ok: true, exited: 0 });
-    const orders = readUserOrders();
+    const allOrders = readUserOrders();
     const now = Date.now();
+    let exitedCount = 0;
     for (const pos of positions) {
+      // Skip symbols that already have a pending exit auto-order — same guard as
+      // the single-exit endpoint to prevent creating duplicate exit orders.
+      const hasPendingExit = allOrders.some(
+        o => o.userId === userId && o.symbol === pos.symbol &&
+             o.isAutoOrder && (o.status === 'PENDING' || o.status === 'PARTIAL')
+      );
+      if (hasPendingExit) continue;
+
       const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
       const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === pos.symbol);
       if (exitSide === 'BUY') {
@@ -938,11 +1113,12 @@ app.post('/api/user/positions/exit-all', requireUserAuth, async (req, res) => {
           writeUsers(users);
         }
       }
-      orders.unshift({
-        id            : crypto.randomUUID(),
+      const posInstEntry = Object.values(INSTRUMENTS).find(i => i.symbol === pos.symbol);
+      allOrders.unshift({
+        id            : generateUserOrderId(posInstEntry ? posInstEntry.id : '0', userId),
         userId,
         symbol        : pos.symbol,
-        name          : instEntry?.name || pos.name || pos.symbol,
+        name          : posInstEntry?.name || pos.name || pos.symbol,
         side          : exitSide,
         orderType     : 'MARKET',
         validity      : 'INTRADAY',
@@ -961,15 +1137,18 @@ app.post('/api/user/positions/exit-all', requireUserAuth, async (req, res) => {
         isAutoOrder   : true,
         autoReason    : 'USER_EXIT_ALL',
       });
+      exitedCount++;
     }
-    writeUserOrders(orders);
-    res.json({ ok: true, exited: positions.length });
+    writeUserOrders(allOrders);
+    res.json({ ok: true, exited: exitedCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // PATCH /api/user/orders/:id — update targetPrice and/or stopLoss on a FILLED order
+// Note: prefer /api/user/positions/target-sl (below) — it uses FIFO matching to find
+// the correct open-position order instead of relying on a specific orderId.
 app.patch('/api/user/orders/:id', requireUserAuth, (req, res) => {
   const userId  = req.user.id;
   const orderId = req.params.id;
@@ -977,10 +1156,58 @@ app.patch('/api/user/orders/:id', requireUserAuth, (req, res) => {
   const orders = readUserOrders();
   const idx    = orders.findIndex(o => o.id === orderId && o.userId === userId);
   if (idx === -1) return res.status(404).json({ error: 'Order not found' });
-  if (targetPrice !== undefined) orders[idx].targetPrice = targetPrice ? parseFloat(targetPrice) : null;
-  if (stopLoss    !== undefined) orders[idx].stopLoss    = stopLoss    ? parseFloat(stopLoss)    : null;
+  if (targetPrice !== undefined) orders[idx].targetPrice = targetPrice != null ? parseFloat(targetPrice) : null;
+  if (stopLoss    !== undefined) orders[idx].stopLoss    = stopLoss    != null ? parseFloat(stopLoss)    : null;
   writeUserOrders(orders);
   res.json({ ok: true, order: orders[idx] });
+});
+
+// PATCH /api/user/positions/target-sl — set Target Price & Stop Loss on a position.
+//
+// Uses FIFO matching to identify which filled orders constitute the CURRENT open
+// position for this user+symbol.  T/SL is applied to those orders (not an
+// arbitrary orderId) so the matching loop's monitoring always reads the correct
+// values – preventing both display and auto-trigger failures.
+//
+// Algorithm:
+//   1. Clear T/SL from ALL non-auto filled orders for this symbol (remove stale values
+//      that may have been left on previously-squared-off orders).
+//   2. Set T/SL on the NEWEST FIFO-open non-auto order so the enrichment query
+//      (which searches newest→oldest) finds it immediately.
+app.patch('/api/user/positions/target-sl', requireUserAuth, (req, res) => {
+  const userId = req.user.id;
+  const { symbol, targetPrice, stopLoss } = req.body;
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+  const orders = readUserOrders();
+
+  // Identify FIFO-open orders for the current position
+  const { openOrders } = getOpenPositionOrders(userId, symbol, orders);
+  const nonAutoOpen    = openOrders.filter(o => !o.isAutoOrder);
+
+  if (nonAutoOpen.length === 0) {
+    return res.status(404).json({ error: 'No open position found for this symbol' });
+  }
+
+  // Step 1: clear any stale T/SL from all non-auto filled orders for this symbol.
+  orders.forEach(o => {
+    if (o.userId === userId && o.symbol === symbol && !o.isAutoOrder && o.status === 'FILLED') {
+      o.targetPrice = null;
+      o.stopLoss    = null;
+    }
+  });
+
+  // Step 2: apply the new T/SL to the newest FIFO-open order.
+  //   openOrders is sorted oldest→newest (FIFO order), so last element is newest.
+  const newestOpen = nonAutoOpen[nonAutoOpen.length - 1];
+  const idx = orders.findIndex(o => o.id === newestOpen.id);
+  if (idx !== -1) {
+    orders[idx].targetPrice = targetPrice != null ? parseFloat(targetPrice) : null;
+    orders[idx].stopLoss    = stopLoss    != null ? parseFloat(stopLoss)    : null;
+  }
+
+  writeUserOrders(orders);
+  res.json({ ok: true });
 });
 
 // ─── Market Data (Admin) ─────────────────────────────────────────────────────
@@ -1435,7 +1662,8 @@ app.get('/api/admin/health', (_req, res) => res.json({ status: 'ok', ts: new Dat
 
 // ─── Background Paper-Trading Matching Loop ──────────────────────────────────
 // Runs every 1 second. Fills PENDING user orders against live QuestDB prices,
-// triggers target/SL auto square-offs, and expires INTRADAY orders at 3:30 PM IST.
+// triggers target/SL auto square-offs, and expires pending non-MARKET orders
+// based on their expiresAt field (120 s for INTRADAY, 24 h for OVERNIGHT).
 // Every state transition (FILLED / CANCELLED / EXPIRED) is written to QuestDB
 // trade_logs via ILP so that  SELECT * FROM trade_logs WHERE user_id = '10001'
 // returns real user trades alongside mock-trader trades.
@@ -1448,10 +1676,6 @@ async function runMatchingLoop() {
     const priceMap = {};
     quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
 
-    const nowIST       = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    const minOfDay     = nowIST.getHours() * 60 + nowIST.getMinutes();
-    const pastCutoff   = minOfDay >= 15 * 60 + 30; // 3:30 PM IST
-
     let changed        = false;
     const newAutoOrders = [];
     // Collect events that must be written to QuestDB after file is saved
@@ -1462,19 +1686,61 @@ async function runMatchingLoop() {
       const currentPrice = priceMap[order.symbol];
       if (!currentPrice) return;
 
-      // Intraday expiry at 3:30 PM IST — overnight stays PENDING overnight
-      if (order.validity === 'INTRADAY' && pastCutoff) {
-        order.status    = 'EXPIRED';
-        order.expiredAt = Date.now();
-        // Refund held balance for BUY
-        if (order.side === 'BUY') {
-          const users = readUsers();
-          const idx   = users.findIndex(u => u.id === order.userId);
-          if (idx !== -1) { users[idx].balance = (users[idx].balance || 0) + order.quantity * (order.price || currentPrice) * 1.002; writeUsers(users); }
+      // ── Time-based expiry ──────────────────────────────────────────────────
+      //
+      // Only non-MARKET orders carry an expiresAt timestamp set at creation:
+      //   • INTRADAY LIMIT/STOP/STOP_LIMIT → expiresAt = placedAt + 120 000 ms
+      //   • OVERNIGHT LIMIT/STOP/STOP_LIMIT → expiresAt = placedAt + 86 400 000 ms
+      //
+      // MARKET orders fill within the next loop tick and are never expired here.
+      // Orders without expiresAt (e.g. legacy MARKET orders) are skipped.
+      if (order.orderType !== 'MARKET' && order.expiresAt != null) {
+        const now = Date.now();
+        if (now >= order.expiresAt) {
+          if (order.filledQuantity > 0) {
+            // Partially filled before expiry → treat the filled portion as FILLED
+            // and silently expire the remainder, refunding only the unfilled hold.
+            const avgFill       = order.averagePrice || order.price || currentPrice;
+            order.status        = 'FILLED';
+            order.fillTimestamp = now;
+            order.fees          = order.filledQuantity * avgFill * 0.001;
+            if (order.side === 'BUY') {
+              const users = readUsers();
+              const idx   = users.findIndex(u => u.id === order.userId);
+              if (idx !== -1) {
+                const pricePerShare = order.price || order.placedAtPrice || currentPrice;
+                const unfilledQty   = order.quantity - order.filledQuantity;
+                // Refund held funds for unfilled portion.
+                users[idx].balance  = (users[idx].balance || 0) + unfilledQty * pricePerShare * 1.002;
+                // Reconcile filled portion: held vs actual.
+                const heldForFilled = order.filledQuantity * pricePerShare * 1.002;
+                const actualFilled  = order.filledQuantity * avgFill + order.fees;
+                users[idx].balance  = (users[idx].balance || 0) + (heldForFilled - actualFilled);
+                writeUsers(users);
+              }
+            }
+            const expiryInstEntry  = Object.values(INSTRUMENTS).find(i => i.symbol === order.symbol);
+            const expiryInstrId    = expiryInstEntry ? expiryInstEntry.id : '0';
+            const expiryTradeId    = generateTradeId(expiryInstrId);
+            const expiryCounterpty = pickMockCounterparty();
+            const expiryBuyerUid   = order.side === 'BUY'  ? String(order.userId) : expiryCounterpty;
+            const expirySellerUid  = order.side === 'SELL' ? String(order.userId) : expiryCounterpty;
+            questdbWrites.push({ order: { ...order }, fillPrice: avgFill, filledQty: order.filledQuantity, statusEvent: 'ORDER_FILLED',
+              opts: { tradeId: expiryTradeId, buyerUserId: expiryBuyerUid, sellerUserId: expirySellerUid } });
+          } else {
+            // Never filled → EXPIRED, full refund of held funds.
+            order.status    = 'EXPIRED';
+            order.expiredAt = now;
+            if (order.side === 'BUY') {
+              const users = readUsers();
+              const idx   = users.findIndex(u => u.id === order.userId);
+              if (idx !== -1) { users[idx].balance = (users[idx].balance || 0) + order.quantity * (order.price || currentPrice) * 1.002; writeUsers(users); }
+            }
+            questdbWrites.push({ order: { ...order }, fillPrice: order.price || currentPrice, filledQty: 0, statusEvent: 'ORDER_EXPIRED', opts: { cancelTimestamp: order.expiredAt } });
+          }
+          changed = true;
+          return;
         }
-        questdbWrites.push({ order: { ...order }, fillPrice: order.price || currentPrice, filledQty: 0, statusEvent: 'ORDER_EXPIRED', opts: { cancelTimestamp: order.expiredAt } });
-        changed = true;
-        return;
       }
 
       // ── Fill conditions ────────────────────────────────────────────────────
@@ -1526,10 +1792,12 @@ async function runMatchingLoop() {
           // to reach the limit from below (i.e. price must rise to limitPx).
           if (placedAt == null || placedAt <= limitPx) {
             // Market was AT or BELOW limit when placed  →  wait for price to RISE
+            // Fill at the limit price (avg price = limit price the user specified).
             if (currentPrice >= limitPx) { shouldFill = true; fillPrice = limitPx; }
           } else {
             // Market was ABOVE limit when placed  →  wait for price to DROP
-            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = currentPrice; }
+            // Fill at the limit price so avg price always equals what the user specified.
+            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = limitPx; }
           }
         } else { // SELL
           if (placedAt == null || placedAt >= limitPx) {
@@ -1544,67 +1812,238 @@ async function runMatchingLoop() {
       } else if (order.orderType === 'STOP' || order.orderType === 'STOP_LIMIT') {
         // BUY STOP:  triggers when price rises  to (or through) stopPrice
         // SELL STOP: triggers when price falls  to (or through) stopPrice
-        if (order.side === 'BUY'  && currentPrice >= order.stopPrice) { shouldFill = true; fillPrice = currentPrice; }
-        if (order.side === 'SELL' && currentPrice <= order.stopPrice) { shouldFill = true; fillPrice = currentPrice; }
+        //
+        // For STOP orders:        fill at the market price at the moment the stop triggers.
+        // For STOP_LIMIT orders:  fill at the user's specified limit price (order.price)
+        //   so avg price = the limit price the user specified, not the current market price.
+        if (order.side === 'BUY'  && currentPrice >= order.stopPrice) {
+          shouldFill = true;
+          fillPrice  = (order.orderType === 'STOP_LIMIT' && order.price) ? order.price : currentPrice;
+        }
+        if (order.side === 'SELL' && currentPrice <= order.stopPrice) {
+          shouldFill = true;
+          fillPrice  = (order.orderType === 'STOP_LIMIT' && order.price) ? order.price : currentPrice;
+        }
       }
 
       if (shouldFill) {
-        order.status         = 'FILLED';
-        order.filledQuantity = order.quantity;
-        order.averagePrice   = fillPrice;
-        order.fillTimestamp  = Date.now();
-        order.fees           = order.quantity * fillPrice * 0.001;
-        if (order.side === 'SELL') {
-          const users = readUsers();
-          const idx   = users.findIndex(u => u.id === order.userId);
-          if (idx !== -1) {
-            users[idx].balance = (users[idx].balance || 0) + order.quantity * fillPrice - order.fees;
-            writeUsers(users);
+        // ── Partial vs instant execution ────────────────────────────────────
+        //
+        // For orders whose total quantity exceeds the instrument's liquidity
+        // threshold (based on LTP), fill a fraction this tick and mark PARTIAL.
+        // The order re-enters the fill path on every subsequent tick until
+        // completely filled, simulating real market absorption.
+        //
+        // Auto square-off orders (T/SL trigger, user Exit, Exit-All) always fill
+        // the FULL remaining quantity in a single tick so the position is closed
+        // as quickly as possible — no partial-fill delay for auto exits.
+        //
+        // avg-price accuracy:
+        //   • LIMIT  orders: every chunk fills at `limitPx`  → avg price = limit price ✓
+        //   • MARKET orders: every chunk fills at live `currentPrice` at that tick
+        //                     → avg price = weighted LTP over fill period ✓
+        const remaining    = order.quantity - order.filledQuantity;
+        const usePartial   = order.isAutoOrder ? false : requiresPartialFill(order.quantity, fillPrice);
+        const chunkQty     = usePartial ? partialChunkQty(remaining) : remaining;
+        const isLastChunk  = (order.filledQuantity + chunkQty) >= order.quantity;
+        const actualChunk  = isLastChunk ? remaining : chunkQty; // never overfill
+        const newFilledQty = order.filledQuantity + actualChunk;
+
+        // Weighted average price: tracks cumulative fill cost across all chunks.
+        const prevAvgPrice = order.averagePrice || 0;
+        const newAvgPrice  = order.filledQuantity === 0
+          ? fillPrice
+          : (prevAvgPrice * order.filledQuantity + fillPrice * actualChunk) / newFilledQty;
+
+        order.filledQuantity = newFilledQty;
+        order.averagePrice   = newAvgPrice;
+
+        if (isLastChunk) {
+          // ── Order fully executed ───────────────────────────────────────────
+          order.status        = 'FILLED';
+          order.fillTimestamp = Date.now();
+          order.fees          = newFilledQty * newAvgPrice * 0.001;
+
+          if (order.side === 'SELL') {
+            const users = readUsers();
+            const idx   = users.findIndex(u => u.id === order.userId);
+            if (idx !== -1) {
+              // Credit last-chunk proceeds and deduct total fees.
+              // Previous partial chunks were already credited per tick.
+              users[idx].balance = (users[idx].balance || 0) + actualChunk * fillPrice - order.fees;
+              writeUsers(users);
+            }
+          } else {
+            // BUY final fill — three cases:
+            //   (a) Auto short-cover: per-chunk debits already done; deduct fees only.
+            //   (b) Regular BUY (user-placed / USER_EXIT auto): funds held upfront;
+            //       reconcile held estimate vs actual weighted cost.
+            const users = readUsers();
+            const idx   = users.findIndex(u => u.id === order.userId);
+            if (idx !== -1) {
+              if (order.isAutoOrder && !order.price && order.autoReason !== 'USER_EXIT' && order.autoReason !== 'USER_EXIT_ALL') {
+                // Short-cover auto BUY — per-chunk debits done; fees only now
+                users[idx].balance = (users[idx].balance || 0) - order.fees;
+              } else {
+                // Regular BUY: held amount was order.quantity × holdPrice × 1.002
+                // (holdPrice = limit price for LIMIT orders, placedAtPrice for MARKET)
+                const heldPricePerShare = order.price || order.placedAtPrice || newAvgPrice;
+                const held   = order.quantity * heldPricePerShare * 1.002;
+                const actual = newFilledQty * newAvgPrice + order.fees;
+                users[idx].balance = (users[idx].balance || 0) + (held - actual);
+              }
+              writeUsers(users);
+            }
           }
+          // avg price written to QuestDB = final weighted average (accurate execution price).
+          // Generate trade ID and counterparty for the final fill — matching C++ engine format.
+          const filledInstEntry  = Object.values(INSTRUMENTS).find(i => i.symbol === order.symbol);
+          const filledInstrId    = filledInstEntry ? filledInstEntry.id : '0';
+          const filledTradeId    = generateTradeId(filledInstrId);
+          const filledCounterpty = pickMockCounterparty();
+          const filledBuyerUid   = order.side === 'BUY'  ? String(order.userId) : filledCounterpty;
+          const filledSellerUid  = order.side === 'SELL' ? String(order.userId) : filledCounterpty;
+          questdbWrites.push({ order: { ...order }, fillPrice: newAvgPrice, filledQty: newFilledQty, statusEvent: 'ORDER_FILLED',
+            opts: { tradeId: filledTradeId, buyerUserId: filledBuyerUid, sellerUserId: filledSellerUid } });
+
         } else {
-          // BUY: adjust for actual fill vs estimated hold
-          const users = readUsers();
-          const idx   = users.findIndex(u => u.id === order.userId);
-          if (idx !== -1) {
-            const held   = order.quantity * (order.price || fillPrice) * 1.002;
-            const actual = order.quantity * fillPrice + order.fees;
-            users[idx].balance = (users[idx].balance || 0) + (held - actual);
-            writeUsers(users);
+          // ── Partial fill this tick ─────────────────────────────────────────
+          order.status = 'PARTIAL';
+
+          if (order.side === 'SELL') {
+            // Credit this chunk's proceeds immediately (fees deducted on final fill).
+            const users = readUsers();
+            const idx   = users.findIndex(u => u.id === order.userId);
+            if (idx !== -1) {
+              users[idx].balance = (users[idx].balance || 0) + actualChunk * fillPrice;
+              writeUsers(users);
+            }
+          } else if (order.isAutoOrder && !order.price && order.autoReason !== 'USER_EXIT' && order.autoReason !== 'USER_EXIT_ALL') {
+            // Short-cover auto BUY partial: deduct each chunk cost now (no prior hold).
+            const users = readUsers();
+            const idx   = users.findIndex(u => u.id === order.userId);
+            if (idx !== -1) {
+              users[idx].balance = (users[idx].balance || 0) - actualChunk * fillPrice;
+              writeUsers(users);
+            }
           }
+          // Regular BUY partial: funds already held at placement — no per-chunk change.
+
+          // Generate trade ID and counterparty for each partial chunk fill.
+          const partInstEntry  = Object.values(INSTRUMENTS).find(i => i.symbol === order.symbol);
+          const partInstrId    = partInstEntry ? partInstEntry.id : '0';
+          const partTradeId    = generateTradeId(partInstrId);
+          const partCounterpty = pickMockCounterparty();
+          const partBuyerUid   = order.side === 'BUY'  ? String(order.userId) : partCounterpty;
+          const partSellerUid  = order.side === 'SELL' ? String(order.userId) : partCounterpty;
+          questdbWrites.push({ order: { ...order }, fillPrice, filledQty: newFilledQty, statusEvent: 'ORDER_PARTIAL',
+            opts: { tradeId: partTradeId, buyerUserId: partBuyerUid, sellerUserId: partSellerUid } });
         }
-        // Queue write to QuestDB trade_logs so the trade is visible per user_id
-        questdbWrites.push({ order: { ...order }, fillPrice, filledQty: order.quantity, statusEvent: 'ORDER_FILLED', opts: {} });
         changed = true;
       }
     });
 
-    // Target / Stop-Loss monitoring on open positions
-    const usersWithPositions = [...new Set(orders.filter(o => o.status === 'FILLED').map(o => o.userId))];
+    // After all fills: clear targetPrice/stopLoss from orders whose position was
+    // fully closed by an auto-exit (T/SL or USER_EXIT) that just filled this tick.
+    // This guarantees T/SL values "vanish" exactly when the position they belong to
+    // is squared off, preventing any residual stale trigger on a future new position
+    // even in edge cases where the FIFO matching might not catch it immediately.
+    const autoFilledThisTick = questdbWrites
+      .filter(w => w.statusEvent === 'ORDER_FILLED' && w.order.isAutoOrder)
+      .map(w => ({ userId: w.order.userId, symbol: w.order.symbol }));
+    const clearedKeys = new Set();
+    autoFilledThisTick.forEach(({ userId, symbol }) => {
+      const key = `${userId}\x00${symbol}`;
+      if (clearedKeys.has(key)) return;
+      clearedKeys.add(key);
+      // Check if the position is fully closed after this auto fill.
+      const remaining = computeUserPositions(userId, priceMap, orders);
+      const stillOpen = remaining.some(p => p.symbol === symbol && Math.abs(p.quantity) > 0.0001);
+      if (!stillOpen) {
+        // Position fully closed — clear T/SL from all user-placed filled orders for
+        // this symbol so they cannot re-trigger on a future new position.
+        orders.forEach(srcOrder => {
+          if (srcOrder.userId === userId &&
+              srcOrder.symbol === symbol &&
+              !srcOrder.isAutoOrder &&
+              srcOrder.status === 'FILLED' &&
+              (srcOrder.targetPrice != null || srcOrder.stopLoss != null)) {
+            srcOrder.targetPrice = null;
+            srcOrder.stopLoss    = null;
+            changed = true;
+          }
+        });
+      }
+    });
+
+    // Target / Stop-Loss monitoring on open positions.
+    //
+    // *** KEY FIX: pass the in-memory `orders` array to computeUserPositions ***
+    //
+    // `orders` was already mutated in the fill section above (status set to
+    // 'FILLED' in-memory). If we let computeUserPositions re-read from the file
+    // it would see a one-tick stale snapshot where the just-filled auto square-off
+    // is still PENDING, making the position appear still open, which re-fires the
+    // trigger every single tick — creating the endless chain of AUTO orders.
+    const usersWithPositions = [...new Set(orders.filter(o => o.status === 'FILLED' || o.status === 'PARTIAL').map(o => o.userId))];
     usersWithPositions.forEach(userId => {
-      const positions = computeUserPositions(userId, priceMap);
+      const positions = computeUserPositions(userId, priceMap, orders);
       positions.forEach(pos => {
         const currentPrice = priceMap[pos.symbol];
         if (!currentPrice) return;
-        // Find most recent filled order for this symbol with target/SL set
-        const relevantFills = orders.filter(o => o.userId === userId && o.symbol === pos.symbol && o.status === 'FILLED');
-        const latest = relevantFills[relevantFills.length - 1];
-        if (!latest) return;
+
+        // FIFO position matching: only use T/SL from orders that are part of
+        // the CURRENT open position.
+        //
+        // CRITICAL FIX: the previous implementation searched ALL non-auto filled
+        // orders for the symbol, including orders from positions that were already
+        // fully exited.  This caused stale T/SL values from old closed positions
+        // to fire spuriously on new positions — even when the user set no T/SL.
+        //
+        // getOpenPositionOrders() FIFO-matches every buy against every sell in
+        // chronological order.  Only orders whose filled quantity has NOT yet been
+        // matched by a later opposite-side fill are returned as "open".  T/SL is
+        // taken exclusively from those currently-open orders, so once a position
+        // is exited, its T/SL values can never affect a subsequent new position.
+        const { openOrders } = getOpenPositionOrders(userId, pos.symbol, orders);
+        // Only non-auto orders carry user-set T/SL values.
+        // Search newest-to-oldest so that when the user edits T/SL via the UI
+        // (PATCH on the most-recent order), the updated values take effect
+        // immediately — not the older order's stale T/SL.
+        const nonAutoOpen = openOrders.filter(o => !o.isAutoOrder);
+        // Search newest first for targetPrice, then for stopLoss separately, so
+        // they can be patched/set on different orders and still both activate.
+        const newestToOldest = [...nonAutoOpen].reverse();
+        const withTarget = newestToOldest.find(o => o.targetPrice != null && o.targetPrice > 0);
+        const withSL     = newestToOldest.find(o => o.stopLoss    != null && o.stopLoss    > 0);
+        if (!withTarget && !withSL) return;
+
+        const effectiveTarget = withTarget?.targetPrice ?? null;
+        const effectiveSL     = withSL?.stopLoss       ?? null;
+
         let trigger = '';
         if (pos.side === 'BUY') {
-          if (latest.targetPrice && currentPrice >= latest.targetPrice) trigger = 'TARGET';
-          if (latest.stopLoss   && currentPrice <= latest.stopLoss)    trigger = 'SL';
+          // BUY position: profit when price rises above target; loss when falls below SL
+          if (effectiveTarget != null && currentPrice >= effectiveTarget) trigger = 'TARGET';
+          if (effectiveSL     != null && currentPrice <= effectiveSL)     trigger = 'SL';
         } else {
-          if (latest.targetPrice && currentPrice <= latest.targetPrice) trigger = 'TARGET';
-          if (latest.stopLoss   && currentPrice >= latest.stopLoss)    trigger = 'SL';
+          // SELL (short) position: profit when price falls below target; loss when rises above SL
+          if (effectiveTarget != null && currentPrice <= effectiveTarget) trigger = 'TARGET';
+          if (effectiveSL     != null && currentPrice >= effectiveSL)     trigger = 'SL';
         }
         if (!trigger) return;
-        const alreadyPendingAuto = orders.some(
-          o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder && (o.status === 'PENDING' || o.status === 'FILLED')
-        ) || newAutoOrders.some(o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder);
+
+        // Guard: block only when a PENDING auto order already exists for this
+        // user+symbol. FILLED auto orders (from closed previous positions) must
+        // NOT block a fresh trigger on a new position on the same instrument.
+        const alreadyPendingAuto =
+          orders.some(o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder && o.status === 'PENDING') ||
+          newAutoOrders.some(o => o.userId === userId && o.symbol === pos.symbol && o.isAutoOrder);
         if (alreadyPendingAuto) return;
-        const squareOffSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
+        const squareOffSide    = pos.side === 'BUY' ? 'SELL' : 'BUY';
+        const tslInstEntry     = Object.values(INSTRUMENTS).find(i => i.symbol === pos.symbol);
         newAutoOrders.push({
-          id            : `AUTO-${crypto.randomUUID()}`,
+          id            : generateUserOrderId(tslInstEntry ? tslInstEntry.id : '0', userId),
           userId,
           symbol        : pos.symbol,
           name          : pos.name,
@@ -1649,6 +2088,60 @@ async function runMatchingLoop() {
 
 setInterval(runMatchingLoop, 1000);
 
+// ─── One-time startup cleanup: remove garbage auto orders ────────────────────
+// The matching-loop bug (stale file read in computeUserPositions) caused an
+// endless chain of AUTO BUY/SELL orders to accumulate in user_orders.json.
+// This runs once at startup: for each user+symbol, any auto order that fires
+// when the net position is already 0 (or goes in the wrong direction) is
+// removed, restoring the correct state without touching user-placed orders.
+function cleanupGarbageAutoOrders() {
+  try {
+    const orders = readUserOrders();
+    const originalCount = orders.length;
+
+    // Build chronological order per user+symbol from all FILLED orders.
+    const filledByKey = {};
+    orders.forEach(o => {
+      if (o.status !== 'FILLED' || !o.filledQuantity) return;
+      const key = `${o.userId}\u0000${o.symbol}`;
+      if (!filledByKey[key]) filledByKey[key] = [];
+      filledByKey[key].push(o);
+    });
+
+    const garbageIds = new Set();
+
+    for (const key of Object.keys(filledByKey)) {
+      // Sort chronologically: oldest first
+      const filled = filledByKey[key].sort(
+        (a, b) => (a.fillTimestamp || a.timestamp || 0) - (b.fillTimestamp || b.timestamp || 0)
+      );
+      let netQty = 0; // running net position (positive = long, negative = short)
+
+      for (const o of filled) {
+        if (o.isAutoOrder) {
+          // An auto SELL is only valid when there is an existing net LONG position.
+          // An auto BUY  is only valid when there is an existing net SHORT position.
+          const isSell = o.side === 'SELL';
+          if (isSell && netQty <= 0) { garbageIds.add(o.id); continue; }
+          if (!isSell && netQty >= 0) { garbageIds.add(o.id); continue; }
+        }
+        // Apply this order to the running net (user-placed orders always apply).
+        netQty += o.side === 'BUY' ? o.filledQuantity : -o.filledQuantity;
+      }
+    }
+
+    if (garbageIds.size > 0) {
+      writeUserOrders(orders.filter(o => !garbageIds.has(o.id)));
+      console.log(`[Startup] Removed ${garbageIds.size} garbage auto orders from user_orders.json (${originalCount} → ${originalCount - garbageIds.size} orders).`);
+    } else {
+      console.log('[Startup] user_orders.json is clean — no garbage auto orders found.');
+    }
+  } catch (err) {
+    console.error('[Startup Cleanup] Failed:', err.message);
+  }
+}
+cleanupGarbageAutoOrders();
+
 // ─── SSE: Real-time user orders stream ──────────────────────────────────────
 // GET /api/user/orders/stream — pushes the authenticated user's full order list
 // every 2 s so the frontend can update all tabs without manual polling.
@@ -1679,7 +2172,8 @@ app.get('/api/user/orders/stream', (req, res) => {
       const priceMap = {};
       quotes.forEach(q => { priceMap[q.symbol] = q.marketPrice; });
 
-      const orders = readUserOrders()
+      const allUserOrders = readUserOrders(); // full list used for position and T/SL enrichment
+      const filteredOrders = allUserOrders
         .filter(o => o.userId === userId)
         .map(o => ({
           id            : o.id,
@@ -1704,12 +2198,26 @@ app.get('/api/user/orders/stream', (req, res) => {
           expiredAt     : o.expiredAt,
           isAutoOrder   : o.isAutoOrder,
           autoReason    : o.autoReason,
+          expiresAt     : o.expiresAt  || null,
           ltp           : priceMap[o.symbol] || null,
         }));
 
-      const positions = computeUserPositions(userId, priceMap);
+      const rawPositions = computeUserPositions(userId, priceMap, allUserOrders);
+      // Enrich positions with active T/SL values from open orders (same FIFO logic
+      // as the matching loop so what's displayed always matches what's monitored).
+      const positions = rawPositions.map(pos => {
+        const { openOrders } = getOpenPositionOrders(userId, pos.symbol, allUserOrders);
+        const nonAutoOpen    = openOrders.filter(o => !o.isAutoOrder);
+        const newestFirst    = [...nonAutoOpen].reverse();
+        const withTarget     = newestFirst.find(o => o.targetPrice != null && o.targetPrice > 0);
+        const withSL         = newestFirst.find(o => o.stopLoss    != null && o.stopLoss    > 0);
+        return { ...pos,
+          targetPrice: withTarget?.targetPrice ?? null,
+          stopLoss   : withSL?.stopLoss        ?? null,
+        };
+      });
 
-      if (!closed) res.write(`data: ${JSON.stringify({ orders, positions })}\n\n`);
+      if (!closed) res.write(`data: ${JSON.stringify({ orders: filteredOrders, positions })}\n\n`);
     } catch (err) {
       if (!closed) res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     }

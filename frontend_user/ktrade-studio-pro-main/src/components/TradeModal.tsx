@@ -188,8 +188,8 @@ export const TradeModal = ({ symbol, open, onClose, defaultSide = 'BUY' }: Trade
                 <Select value={validity} onValueChange={(v) => setValidity(v as OrderValidity)}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="INTRADAY">Intraday (expires 3:30 PM IST)</SelectItem>
-                    <SelectItem value="OVERNIGHT">Overnight (persists next day)</SelectItem>
+                    <SelectItem value="INTRADAY">Intraday (limit orders expire in 120s)</SelectItem>
+                    <SelectItem value="OVERNIGHT">Overnight (limit orders expire in 24h)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

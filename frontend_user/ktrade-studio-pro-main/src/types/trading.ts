@@ -62,6 +62,11 @@ export interface Order {
   fees: number;
   timestamp: number;
   fillTimestamp?: number;
+  cancelledAt?: number;
+  expiredAt?: number;
+  expiresAt?: number | null;   // absolute ms timestamp when order will auto-expire
+  isAutoOrder?: boolean;
+  autoReason?: string;
   // Circuit breaker fields (present on order-placement response)
   circuitStatus?: 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE';
   circuitBand?: number;
@@ -77,6 +82,8 @@ export interface Position {
   unrealizedPnlPercent: number;
   side: OrderSide;
   timestamp: number;
+  targetPrice?: number | null;
+  stopLoss?: number | null;
 }
 
 export interface Account {

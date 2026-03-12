@@ -9,7 +9,7 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks';
 import { setOrders, cancelOrder, setPositions, setMyTrades } from '@/store/tradingSlice';
 import { orderServiceApi } from '@/services/orderServiceApi';
 import { cn } from '@/lib/utils';
-import { X, ChevronUp, ChevronDown, LogOut, Target, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
+import { X, ChevronUp, ChevronDown, LogOut, Target, ArrowUpCircle, ArrowDownCircle, Clock } from 'lucide-react';
 import { toast } from 'sonner';
 
 const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:3000/api')
@@ -18,12 +18,46 @@ const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:3000/api')
 interface EditDialog {
   open: boolean;
   symbol: string;
-  orderId: string;
   targetPrice: string;
   stopLoss: string;
 }
 
-const EMPTY_EDIT: EditDialog = { open: false, symbol: '', orderId: '', targetPrice: '', stopLoss: '' };
+const EMPTY_EDIT: EditDialog = { open: false, symbol: '', targetPrice: '', stopLoss: '' };
+
+// ── Countdown helper ─────────────────────────────────────────────────────
+// Returns { label, urgency } for a pending non-MARKET limit order.
+//   urgency: 'normal' | 'warning' | 'critical'
+function computeCountdown(
+  expiresAt: number | null | undefined,
+  validity: string | undefined,
+  orderType: string | undefined,
+): { label: string; urgency: 'normal' | 'warning' | 'critical' } | null {
+  // Only non-MARKET orders have a timer
+  if (!expiresAt || orderType === 'MARKET') return null;
+
+  const remaining = expiresAt - Date.now(); // ms remaining
+
+  if (remaining <= 0) return { label: 'Expiring…', urgency: 'critical' };
+
+  if (validity === 'OVERNIGHT') {
+    // Show HH:MM:SS for overnight orders
+    const totalSec = Math.floor(remaining / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    const label = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    const urgency = h < 1 ? 'warning' : 'normal';
+    return { label, urgency };
+  } else {
+    // INTRADAY — 120-second window; show MM:SS
+    const totalSec = Math.floor(remaining / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    const label = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    const urgency = totalSec <= 10 ? 'critical' : totalSec <= 30 ? 'warning' : 'normal';
+    return { label, urgency };
+  }
+}
 
 export const OrdersPanel = () => {
   const dispatch    = useAppDispatch();
@@ -34,8 +68,15 @@ export const OrdersPanel = () => {
   const [savingEdit,    setSavingEdit]    = useState(false);
   const [exitingAll,    setExitingAll]    = useState(false);
   const [exitingSymbol, setExitingSymbol] = useState<string | null>(null);
+  // Tick every second to drive real-time countdown for pending limit orders
+  const [tick, setTick] = useState(0);
   const sseRef      = useRef<EventSource | null>(null);
   const pollRef     = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // ── HTTP fallback fetch (used when SSE is unavailable) ───────────────────
   const fetchAll = useCallback(async () => {
@@ -97,6 +138,7 @@ export const OrdersPanel = () => {
               expiredAt     : d.expiredAt,
               isAutoOrder   : d.isAutoOrder,
               autoReason    : d.autoReason,
+              expiresAt     : d.expiresAt,
               ltp           : d.ltp,
             }));
             dispatch(setOrders(orders));
@@ -111,6 +153,8 @@ export const OrdersPanel = () => {
               unrealizedPnlPercent: p.unrealizedPnlPercent || 0,
               side                : p.side || 'BUY',
               timestamp           : p.timestamp || Date.now(),
+              targetPrice         : p.targetPrice ?? null,
+              stopLoss            : p.stopLoss    ?? null,
             }));
             dispatch(setPositions(positions));
           }
@@ -203,26 +247,29 @@ export const OrdersPanel = () => {
 
   // ── Open edit Target/SL dialog ────────────────────────────────────────────
   const handleOpenEdit = (symbol: string) => {
-    const filledBuy = orders
-      .filter(o => o.symbol === symbol && o.status === 'FILLED' && o.side === 'BUY')
-      .sort((a, b) => (b.fillTimestamp || b.timestamp) - (a.fillTimestamp || a.timestamp))[0];
+    // Read the currently-active T/SL straight from the enriched position object.
+    // The position is already enriched by the backend using the same FIFO logic
+    // as the matching loop, so what we pre-fill into the dialog is exactly what
+    // is being monitored for auto square-off — no mismatch possible.
+    const pos = positions.find(p => p.symbol === symbol);
     setEditDialog({
       open       : true,
       symbol,
-      orderId    : filledBuy?.id || '',
-      targetPrice: filledBuy?.targetPrice != null ? String(filledBuy.targetPrice) : '',
-      stopLoss   : filledBuy?.stopLoss    != null ? String(filledBuy.stopLoss)    : '',
+      targetPrice: pos?.targetPrice != null ? String(pos.targetPrice) : '',
+      stopLoss   : pos?.stopLoss    != null ? String(pos.stopLoss)    : '',
     });
   };
 
   // ── Save Target/SL changes ────────────────────────────────────────────────
   const handleSaveEdit = async () => {
-    if (!editDialog.orderId) { toast.error('Could not find the matching order to update.'); return; }
     setSavingEdit(true);
     try {
       const tp = editDialog.targetPrice ? parseFloat(editDialog.targetPrice) : null;
       const sl = editDialog.stopLoss    ? parseFloat(editDialog.stopLoss)    : null;
-      const ok = await orderServiceApi.updateOrderTargetSL(editDialog.orderId, tp, sl);
+      // Use the position-level endpoint so the backend resolves the correct
+      // FIFO-open order — guarantees the T/SL is set on the same order that
+      // the matching loop monitors for auto square-off.
+      const ok = await orderServiceApi.updatePositionTargetSL(editDialog.symbol, tp, sl);
       if (ok) { toast.success('Target & Stop Loss updated'); setEditDialog(EMPTY_EDIT); fetchAll(); }
       else      toast.error('Failed to update Target / Stop Loss');
     } finally { setSavingEdit(false); }
@@ -322,6 +369,8 @@ export const OrdersPanel = () => {
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">Qty</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">Avg Price</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">LTP</th>
+                        <th className="text-right py-2 px-4 font-medium text-success/80">Target</th>
+                        <th className="text-right py-2 px-4 font-medium text-destructive/80">Stop Loss</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">P&amp;L</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">P&amp;L %</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">Action</th>
@@ -329,7 +378,7 @@ export const OrdersPanel = () => {
                     </thead>
                     <tbody className="divide-y">
                       {livePositions.length === 0 ? (
-                        <tr><td colSpan={7} className="text-center text-muted-foreground py-8 text-sm">No active positions</td></tr>
+                        <tr><td colSpan={9} className="text-center text-muted-foreground py-8 text-sm">No active positions</td></tr>
                       ) : livePositions.map((p) => (
                         <tr
                           key={p.symbol}
@@ -348,6 +397,16 @@ export const OrdersPanel = () => {
                           </td>
                           <td className="text-right py-2 px-4">₹{p.averagePrice.toFixed(2)}</td>
                           <td className="text-right py-2 px-4 font-medium">₹{p.currentPrice.toFixed(2)}</td>
+                          <td className="text-right py-2 px-4">
+                            {p.targetPrice != null
+                              ? <span className="text-success font-medium text-xs">₹{Number(p.targetPrice).toFixed(2)}</span>
+                              : <span className="text-muted-foreground text-xs">—</span>}
+                          </td>
+                          <td className="text-right py-2 px-4">
+                            {p.stopLoss != null
+                              ? <span className="text-destructive font-medium text-xs">₹{Number(p.stopLoss).toFixed(2)}</span>
+                              : <span className="text-muted-foreground text-xs">—</span>}
+                          </td>
                           <td className={cn('text-right py-2 px-4 font-medium', p.unrealizedPnl >= 0 ? 'text-success' : 'text-destructive')}>
                             {p.unrealizedPnl >= 0 ? '+' : ''}₹{p.unrealizedPnl.toFixed(2)}
                           </td>
@@ -382,31 +441,45 @@ export const OrdersPanel = () => {
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Time</th>
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Instrument</th>
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Side / Type</th>
-                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Qty</th>
+                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Qty (Filled)</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">Price</th>
+                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Avg Fill</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">LTP</th>
                         <th className="text-center py-2 px-4 font-medium text-muted-foreground">Validity</th>
+                        <th className="text-center py-2 px-4 font-medium text-muted-foreground">Expires In</th>
                         <th className="text-right py-2 px-4 font-medium text-muted-foreground">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y">
                       {pendingOrders.length === 0 ? (
-                        <tr><td colSpan={8} className="text-center text-muted-foreground py-8 text-sm">No pending orders</td></tr>
+                        <tr><td colSpan={10} className="text-center text-muted-foreground py-8 text-sm">No pending orders</td></tr>
                       ) : pendingOrders.map((o) => {
+
                         const ltp          = getLTP(o.symbol);
                         const limitPrice   = o.price;
+                        // For STOP/STOP_LIMIT: the trigger price is stopPrice, not the limit price
+                        const stopPrice    = o.stopPrice;
+                        // Reference price for circuit-deviation calculation:
+                        // LIMIT/STOP_LIMIT → limit price; STOP (market stop) → stop trigger price
+                        const refPrice     = limitPrice ?? stopPrice ?? null;
                         // Circuit deviation of the ORDER's limit price vs current LTP
-                        const pctDiff      = (ltp && limitPrice && ltp > 0)
-                          ? ((limitPrice - ltp) / ltp) * 100
+                        const pctDiff      = (ltp && refPrice && ltp > 0)
+                          ? ((refPrice - ltp) / ltp) * 100
                           : null;
                         const isUpperCirc  = pctDiff !== null && pctDiff  >=  20;
                         const isLowerCirc  = pctDiff !== null && pctDiff  <= -20;
                         const isModCirc    = !isUpperCirc && !isLowerCirc && pctDiff !== null && Math.abs(pctDiff) >= 5;
-
-                        // Also check live symbol circuit status
                         const symInfo      = symbols.find(s => s.symbol === o.symbol);
                         const symInUC      = symInfo?.circuitStatus === 'UPPER_CIRCUIT';
                         const symInLC      = symInfo?.circuitStatus === 'LOWER_CIRCUIT';
+
+                        // Countdown for non-MARKET pending limit orders (uses tick to re-render)
+                        void tick; // reference tick to re-render every second
+                        const countdown = computeCountdown(
+                          o.expiresAt,
+                          (o as any).validity,
+                          o.type,
+                        );
 
                         return (
                         <tr key={o.id} className={cn(
@@ -439,11 +512,50 @@ export const OrdersPanel = () => {
                             </div>
                           </td>
                           <td className="py-2 px-4">
-                            <span className={o.side === 'BUY' ? 'text-success' : 'text-destructive'}>{o.side}</span>
-                            <span className="text-muted-foreground ml-1 text-xs">{o.type}</span>
+                            <div className="flex items-center gap-1.5">
+                              <span className={o.side === 'BUY' ? 'text-success' : 'text-destructive'}>{o.side}</span>
+                              <span className="text-muted-foreground text-xs">{o.type}</span>
+                              {o.status === 'PARTIAL' && (
+                                <span className="inline-flex items-center rounded px-1 py-0.5 text-[9px] font-bold bg-blue-100 text-blue-700 border border-blue-300 dark:bg-blue-900/40 dark:text-blue-300">
+                                  PARTIAL
+                                </span>
+                              )}
+                            </div>
                           </td>
-                          <td className="text-right py-2 px-4">{o.quantity}</td>
-                          <td className="text-right py-2 px-4">{o.price ? `₹${o.price.toFixed(2)}` : 'Market'}</td>
+                          <td className="text-right py-2 px-4">
+                            {o.status === 'PARTIAL' && o.filledQuantity > 0 ? (
+                              <div>
+                                <span className="text-blue-500 font-medium">{o.filledQuantity}</span>
+                                <span className="text-muted-foreground">/{o.quantity}</span>
+                              </div>
+                            ) : (
+                              o.quantity
+                            )}
+                          </td>
+                          <td className="text-right py-2 px-4">
+                            {/* For STOP/STOP_LIMIT show both the trigger and limit price */}
+                            {(o.type === 'STOP' || o.type === 'STOP_LIMIT') && stopPrice != null ? (
+                              <div>
+                                <div className="text-xs text-muted-foreground">Trigger</div>
+                                <div>₹{stopPrice.toFixed(2)}</div>
+                                {o.type === 'STOP_LIMIT' && o.price != null && (
+                                  <>
+                                    <div className="text-xs text-muted-foreground mt-0.5">Limit</div>
+                                    <div>₹{o.price.toFixed(2)}</div>
+                                  </>
+                                )}
+                              </div>
+                            ) : (
+                              o.price != null ? `₹${o.price.toFixed(2)}` : 'Market'
+                            )}
+                          </td>
+                          <td className="text-right py-2 px-4">
+                            {o.status === 'PARTIAL' && o.averagePrice != null ? (
+                              <span className="text-blue-500 font-medium">₹{o.averagePrice.toFixed(2)}</span>
+                            ) : (
+                              <span className="text-muted-foreground text-xs">—</span>
+                            )}
+                          </td>
                           <td className="text-right py-2 px-4 font-medium">
                             {ltp != null ? `₹${ltp.toFixed(2)}` : '—'}
                             {pctDiff !== null && (
@@ -460,6 +572,21 @@ export const OrdersPanel = () => {
                             <span className={cn('text-xs px-2 py-0.5 rounded-full font-medium', (o as any).validity === 'OVERNIGHT' ? 'bg-blue-500/20 text-blue-400' : 'bg-warning/20 text-warning')}>
                               {(o as any).validity || 'INTRADAY'}
                             </span>
+                          </td>
+                          <td className="text-center py-2 px-4">
+                            {countdown ? (
+                              <span className={cn(
+                                'inline-flex items-center gap-1 text-xs font-mono font-medium',
+                                countdown.urgency === 'critical' && 'text-destructive animate-pulse',
+                                countdown.urgency === 'warning'  && 'text-orange-400',
+                                countdown.urgency === 'normal'   && 'text-muted-foreground',
+                              )}>
+                                <Clock className="w-3 h-3" />
+                                {countdown.label}
+                              </span>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">—</span>
+                            )}
                           </td>
                           <td className="text-right py-2 px-4">
                             <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive hover:text-destructive" onClick={() => handleCancel(o.id)}>
@@ -522,8 +649,8 @@ export const OrdersPanel = () => {
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Time</th>
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Instrument</th>
                         <th className="text-left py-2 px-4 font-medium text-muted-foreground">Side / Type</th>
-                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Qty</th>
-                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Price</th>
+                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Qty Filled</th>
+                        <th className="text-right py-2 px-4 font-medium text-muted-foreground">Exec. Price</th>
                         <th className="text-center py-2 px-4 font-medium text-muted-foreground">Status</th>
                       </tr>
                     </thead>
@@ -544,11 +671,25 @@ export const OrdersPanel = () => {
                             <span className={o.side === 'BUY' ? 'text-success' : 'text-destructive'}>{o.side}</span>
                             <span className="text-muted-foreground ml-1 text-xs">{o.type}</span>
                           </td>
-                          <td className="text-right py-2 px-4">{o.quantity}</td>
                           <td className="text-right py-2 px-4">
-                            {o.status === 'FILLED' && o.averagePrice
-                              ? `₹${o.averagePrice.toFixed(2)}`
-                              : o.price ? `₹${o.price.toFixed(2)}` : 'Market'}
+                            {/* For FILLED orders: show filled qty / total ordered */}
+                            {o.status === 'FILLED' ? (
+                              <span>
+                                {(o.filledQuantity > 0 && o.filledQuantity < o.quantity)
+                                  ? <><span className="text-warning">{o.filledQuantity}</span><span className="text-muted-foreground">/{o.quantity}</span></>
+                                  : o.filledQuantity || o.quantity}
+                              </span>
+                            ) : (
+                              o.quantity
+                            )}
+                          </td>
+                          <td className="text-right py-2 px-4">
+                            {/* For FILLED orders: always show the actual execution avg price */}
+                            {o.status === 'FILLED'
+                              ? (o.averagePrice != null
+                                  ? `₹${o.averagePrice.toFixed(2)}`
+                                  : o.price != null ? `₹${o.price.toFixed(2)}` : '—')
+                              : o.price != null ? `₹${o.price.toFixed(2)}` : 'Market'}
                           </td>
                           <td className="text-center py-2 px-4">
                             <span className={cn(

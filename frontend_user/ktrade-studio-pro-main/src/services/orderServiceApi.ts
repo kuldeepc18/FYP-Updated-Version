@@ -43,6 +43,11 @@ class OrderServiceApi {
       timestamp     : d.timestamp,
       fillTimestamp : d.fillTimestamp,
       averagePrice  : d.averagePrice,
+      expiresAt     : d.expiresAt     ?? null,
+      cancelledAt   : d.cancelledAt   ?? null,
+      expiredAt     : d.expiredAt     ?? null,
+      isAutoOrder   : d.isAutoOrder   ?? false,
+      autoReason    : d.autoReason    ?? null,
     };
   }
 
@@ -66,6 +71,11 @@ class OrderServiceApi {
         timestamp     : d.timestamp,
         fillTimestamp : d.fillTimestamp,
         averagePrice  : d.averagePrice,
+        expiresAt     : d.expiresAt     ?? null,
+        cancelledAt   : d.cancelledAt   ?? null,
+        expiredAt     : d.expiredAt     ?? null,
+        isAutoOrder   : d.isAutoOrder   ?? false,
+        autoReason    : d.autoReason    ?? null,
       }));
     } catch {
       return [];
@@ -93,6 +103,8 @@ class OrderServiceApi {
         unrealizedPnlPercent: d.unrealizedPnlPercent || 0,
         side                : d.side || 'BUY',
         timestamp           : d.timestamp || Date.now(),
+        targetPrice         : d.targetPrice ?? null,
+        stopLoss            : d.stopLoss    ?? null,
       }));
     } catch {
       return [];
@@ -129,6 +141,20 @@ class OrderServiceApi {
   async updateOrderTargetSL(orderId: string, targetPrice: number | null, stopLoss: number | null): Promise<boolean> {
     try {
       await apiClient.patch(`${API_ENDPOINTS.USER.ORDERS_UPDATE}/${orderId}`, { targetPrice, stopLoss });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Preferred method: sets T/SL on the FIFO-identified open position order.
+  // Unlike updateOrderTargetSL (which requires knowing the correct orderId),
+  // this endpoint resolves the correct open order on the server side using
+  // the same FIFO logic as the matching loop — guaranteeing that the displayed
+  // T/SL and the triggered T/SL always come from the same order.
+  async updatePositionTargetSL(symbol: string, targetPrice: number | null, stopLoss: number | null): Promise<boolean> {
+    try {
+      await apiClient.patch(API_ENDPOINTS.USER.POSITIONS_TARGET_SL, { symbol, targetPrice, stopLoss });
       return true;
     } catch {
       return false;
