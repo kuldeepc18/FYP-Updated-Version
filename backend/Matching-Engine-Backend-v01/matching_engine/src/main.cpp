@@ -271,23 +271,46 @@ public:
         bookServerRunning_ = true;
         bookServerThread_  = std::thread(&TradingApplication::serveBookHttp, this);
 
-        // ── Start mock traders (200 per instrument) with diverse archetypes ──
-        // Archetype distribution:
-        //   i <  10 → MARKET_MAKER    (10/200,  5%) — continuous two-sided quotes
-        //   i <  60 → MOMENTUM        (50/200, 25%) — trend-following
-        //   i <  80 → MEAN_REVERSION  (20/200, 10%) — bounces/pullbacks
-        //   i < 200 → NOISE           (120/200,60%) — OU-biased retail participants
-        // 15 instruments × 200 traders = 3 000 total mock traders.
+        // ── Start mock traders ────────────────────────────────────────────────
+        // Total: 15 instruments × 200 traders = 3 000 mock traders.
+        //
+        // Creation order (governs mockTraderCount-based ID assignment):
+        //
+        //  Pass 1 — Spoofing manipulators (one per instrument, IDs 1–15)
+        //    mockTraderCount starts at 1 → IDs 1..15 are the 15 spoof manipulators.
+        //    Each is assigned its own instrument so that exactly one unique
+        //    manipulator operates per instrument.
+        //    Archetype::SPOOFING → runSpoofing() is dispatched inside MockTrader::run().
+        //
+        //  Pass 2 — Normal traders (199 per instrument, IDs 16–3 000)
+        //    Archetype distribution per 199-slot instrument block:
+        //      i <  10 → MARKET_MAKER    ( 10, ~5%)  continuous two-sided quotes
+        //      i <  59 → MOMENTUM        ( 49,~25%)  trend-following
+        //      i <  79 → MEAN_REVERSION  ( 20, 10%)  buy dips / sell rallies
+        //      i < 199 → NOISE           (120,~60%)  OU-biased retail participants
+
+        // ── Pass 1: one spoofing manipulator per instrument (IDs 1–15) ────────
         for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
             auto ob = orderBooks_[instrument.instrumentId];
-            for (int i = 0; i < 200; ++i) {
+            mockTraders_.emplace_back(
+                std::make_unique<MockTrader>(
+                    ob, instrument.instrumentId, &logger_,
+                    MockTrader::Archetype::SPOOFING));
+            mockTraders_.back()->start();
+        }
+
+        // ── Pass 2: 199 normal traders per instrument (IDs 16–3 000) ──────────
+        for (const auto& instrument : InstrumentManager::getInstance().getInstruments()) {
+            auto ob = orderBooks_[instrument.instrumentId];
+            for (int i = 0; i < 199; ++i) {
                 MockTrader::Archetype arch;
                 if      (i < 10)  arch = MockTrader::Archetype::MARKET_MAKER;
-                else if (i < 60)  arch = MockTrader::Archetype::MOMENTUM;
-                else if (i < 80)  arch = MockTrader::Archetype::MEAN_REVERSION;
+                else if (i < 59)  arch = MockTrader::Archetype::MOMENTUM;
+                else if (i < 79)  arch = MockTrader::Archetype::MEAN_REVERSION;
                 else              arch = MockTrader::Archetype::NOISE;
                 mockTraders_.emplace_back(
-                    std::make_unique<MockTrader>(ob, instrument.instrumentId, &logger_, arch));
+                    std::make_unique<MockTrader>(
+                        ob, instrument.instrumentId, &logger_, arch));
                 mockTraders_.back()->start();
             }
         }

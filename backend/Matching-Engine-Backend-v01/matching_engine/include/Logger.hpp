@@ -164,6 +164,9 @@ public:
         const std::string userId    = sanitizeTag(order.getTraderId());
         const std::string phase     = sanitizeTag(order.getMarketPhase());
         const std::string devHash   = sanitizeTag(order.getDeviceIdHash());
+        // trader_type: MANIPULATOR if user is one of the 15 spoof traders (IDs 1–15)
+        const std::string traderType = isManipulatorId(order.getTraderId())
+                                           ? "MANIPULATOR" : "NORMAL";
 
         const long long qty          = static_cast<long long>(order.getQuantity());
         const long long filledQty    = static_cast<long long>(
@@ -201,6 +204,11 @@ public:
             << ",aggressor_side=NA"              // NA for non-match order events
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash
+            // trader_type: MANIPULATOR | NORMAL based on the user who placed the order
+            // buyer_trader_type / seller_trader_type: NA for order events (not a trade)
+            << ",trader_type="           << traderType
+            << ",buyer_trader_type=NA"
+            << ",seller_trader_type=NA"
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << order.getPrice()
@@ -253,6 +261,26 @@ public:
                                              : trade.getSellerUserId();
         const std::string devHash      = sanitizeTag(Order::computeDeviceIdHash(aggrUserId));
 
+        // ── Trader-type classification ────────────────────────────────────────
+        // trader_type        : MANIPULATOR if the aggressor (price-taking side) is one
+        //                      of the 15 spoof manipulators (IDs 1–15); else NORMAL.
+        // buyer_trader_type  : MANIPULATOR if buyer  ∈ {1..15}; else NORMAL.
+        // seller_trader_type : MANIPULATOR if seller ∈ {1..15}; else NORMAL.
+        //
+        // Rules (from spec):
+        //  1. Manipulator places BUY  (aggressor)  → trader_type=MANIPULATOR,
+        //       buyer_trader_type=MANIPULATOR, seller_trader_type=NORMAL
+        //  2. Manipulator places SELL (aggressor)  → trader_type=MANIPULATOR,
+        //       seller_trader_type=MANIPULATOR, buyer_trader_type=NORMAL
+        //  3. Normal places BUY, manipulator is passive SELL counterparty →
+        //       trader_type=NORMAL, buyer_trader_type=NORMAL, seller_trader_type=MANIPULATOR
+        //  4. Normal places SELL, manipulator is passive BUY counterparty →
+        //       trader_type=NORMAL, seller_trader_type=NORMAL, buyer_trader_type=MANIPULATOR
+        //  5. Both normal → all NORMAL
+        const std::string aggrTraderType   = isManipulatorId(aggrUserId)   ? "MANIPULATOR" : "NORMAL";
+        const std::string buyerTraderType  = isManipulatorId(buyerUid)     ? "MANIPULATOR" : "NORMAL";
+        const std::string sellerTraderType = isManipulatorId(sellerUid)    ? "MANIPULATOR" : "NORMAL";
+
         const long long   qty          = static_cast<long long>(trade.getQuantity());
         const long long   matchMicros  = toMicros(std::chrono::system_clock::now());
         const long long   submitMicros = toMicros(trade.getTimestamp());
@@ -273,6 +301,10 @@ public:
             << ",aggressor_side="     << aggrSide
             << ",market_phase="       << phase
             << ",device_id_hash="     << devHash  // aggressor's fingerprint — always present
+            // Trader-type classification (see rules above)
+            << ",trader_type="           << aggrTraderType
+            << ",buyer_trader_type="     << buyerTraderType
+            << ",seller_trader_type="    << sellerTraderType
             // ── field section ──────────────────────────────────────────────
             << " "
             << "price="                     << std::fixed << trade.getPrice()
@@ -339,6 +371,22 @@ private:
             close_sock(sock_); sock_ = INVALID_SOCK;
             if (connectToQuestDB())
                 sendAll(sock_, ilpLine.c_str(), ilpLine.size());
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  isManipulatorId()
+    //  ─────────────────────────────────────────────────────────────────────────
+    //  Returns true when userId represents one of the 15 spoofing manipulator
+    //  mock traders (integer IDs 1..15).  Used to populate trader_type,
+    //  buyer_trader_type and seller_trader_type tags in QuestDB trade_logs.
+    // ──────────────────────────────────────────────────────────────────────────
+    static bool isManipulatorId(const std::string& userId) {
+        try {
+            int id = std::stoi(userId);
+            return id >= 1 && id <= 15;
+        } catch (...) {
+            return false;
         }
     }
 

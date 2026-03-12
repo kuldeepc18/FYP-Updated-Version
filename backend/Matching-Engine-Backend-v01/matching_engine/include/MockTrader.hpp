@@ -84,6 +84,49 @@ static constexpr double CIRCULAR_PRICE_JITTER    = 0.002; // ±0.2 % price noise
 // Ring member IDs — defines the directed cycle 2500 → 2600 → 2700 → 2800 → 2500
 static const int CIRCULAR_RING_IDS[4] = {2500, 2600, 2700, 2800};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANIPULATION #3 — SPOOFING  (traders 1..15, one per instrument)
+//  ─────────────────────────────────────────────────────────────────────────────
+//  SPOOFING_ACTIVE   master on/off switch.
+//    true  → traders with IDs 1–15 (one per instrument) each run a spoofing
+//            cycle: place a very large fake LIMIT order (buy or sell), let it
+//            sit visible in the order book, then cancel it with a high and
+//            variable probability (>60 %).  Immediately after, they place a
+//            real LIMIT-IOC order in the opposite direction to profit from the
+//            artificial price movement they created.
+//    false → all 15 traders revert to their archetype (SPOOFING enum value is
+//            treated as NOISE by the dispatch switch).
+//
+//  SPOOF_MIN_USER_ID / SPOOF_MAX_USER_ID
+//    Range of mock-trader integer IDs that are designated as spoof manipulators.
+//    MockTrader::mockTraderCount starts at 1, so the first 15 traders created —
+//    one per instrument — receive IDs 1..15 and are marked isSpoofTrader_=true.
+//
+//  QuestDB trade_logs will carry:
+//    trader_type        = MANIPULATOR  for any order row from traders 1..15
+//    buyer_trader_type  = MANIPULATOR  on any TRADE_MATCH row where buyer  ∈ {1..15}
+//    seller_trader_type = MANIPULATOR  on any TRADE_MATCH row where seller ∈ {1..15}
+// ═══════════════════════════════════════════════════════════════════════════════
+static constexpr bool   SPOOFING_ACTIVE          = true;
+static constexpr int    SPOOF_MIN_USER_ID         = 1;       // first manipulator ID
+static constexpr int    SPOOF_MAX_USER_ID         = 15;      // last  manipulator ID
+
+// ── Spoof order (the large fake leg) ─────────────────────────────────────────
+static constexpr size_t SPOOF_LARGE_QTY_MIN       = 50000;   // min fake-order quantity
+static constexpr size_t SPOOF_LARGE_QTY_MAX       = 150000;  // max fake-order quantity
+
+// ── Real opposite trade (the actual profit-taking leg) ────────────────────────
+static constexpr size_t SPOOF_REAL_QTY_MIN        = 5000;    // min real-trade quantity
+static constexpr size_t SPOOF_REAL_QTY_MAX        = 30000;   // max real-trade quantity
+
+// ── Timing parameters ─────────────────────────────────────────────────────────
+static constexpr int    SPOOF_CANCEL_WAIT_MIN_MS  = 300;     // how long the fake order shows
+static constexpr int    SPOOF_CANCEL_WAIT_MAX_MS  = 1200;
+static constexpr double SPOOF_CANCEL_RATE_MIN     = 0.65;    // variable cancel rate, >60 %
+static constexpr double SPOOF_CANCEL_RATE_MAX     = 0.92;
+static constexpr int    SPOOF_PAUSE_MIN_MS        = 800;     // pause between spoof cycles
+static constexpr int    SPOOF_PAUSE_MAX_MS        = 3000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -251,11 +294,13 @@ class MockTrader {
 public:
     // ── Trader archetypes ─────────────────────────────────────────────────────
     // Assignment per instrument (200 traders total):
+    //   1 SPOOFING  manipulator (ID 1..15, one per instrument) — runs first
     //   i <  10 → MARKET_MAKER   (10,  5%) — continuous two-sided quotes
-    //   i <  60 → MOMENTUM       (50, 25%) — trend-following, LTP history driven
-    //   i <  80 → MEAN_REVERSION (20, 10%) — buys dips, sells rallies
-    //   i < 200 → NOISE          (120,60%) — OU-biased random retail orders
-    enum class Archetype { NOISE, MOMENTUM, MEAN_REVERSION, MARKET_MAKER };
+    //   i <  59 → MOMENTUM       (49, ~25%) — trend-following, LTP history driven
+    //   i <  79 → MEAN_REVERSION (20, 10%) — buys dips, sells rallies
+    //   i < 199 → NOISE          (120,~60%) — OU-biased random retail orders
+    // 15 instruments × 200 traders = 3 000 total mock traders.
+    enum class Archetype { NOISE, MOMENTUM, MEAN_REVERSION, MARKET_MAKER, SPOOFING };
 
     static int mockTraderCount;
 
@@ -278,6 +323,13 @@ public:
         // Designate trader #2500 as the wash-trade manipulator.
         // Flip WASH_TRADER_ACTIVE to false to revert #2500 to its assigned archetype.
         isWashTrader_ = (WASH_TRADER_ACTIVE && myId == WASH_TRADER_USER_ID);
+
+        // Designate traders #1..#15 as spoofing manipulators (one per instrument).
+        // mockTraderCount starts at 1, so these are the first 15 traders created.
+        // Flip SPOOFING_ACTIVE to false to revert them to their assigned archetype.
+        isSpoofTrader_ = (SPOOFING_ACTIVE &&
+                          myId >= SPOOF_MIN_USER_ID &&
+                          myId <= SPOOF_MAX_USER_ID);
     }
 
     void start() {
@@ -543,6 +595,130 @@ private:
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    //  SPOOFING MANIPULATOR  (traders 1–15, one per instrument)
+    //
+    //  Spoofing cycle (repeats indefinitely — no trade-count cap):
+    //
+    //  1. Choose direction randomly:
+    //       spoofBuy   = true  → place large fake BUY (simulate demand), real SELL
+    //       spoofBuy   = false → place large fake SELL (simulate supply), real BUY
+    //
+    //  2. Submit the large LIMIT GTC "spoof" order so it sits visibly in the
+    //     order book.  Quantity: SPOOF_LARGE_QTY_MIN – SPOOF_LARGE_QTY_MAX.
+    //     Price is set conservatively (spoof BUY below LTP, spoof SELL above LTP)
+    //     so the order is unlikely to match immediately.
+    //
+    //  3. Let the order rest for SPOOF_CANCEL_WAIT_MIN_MS – SPOOF_CANCEL_WAIT_MAX_MS
+    //     milliseconds so other participants perceive the artificial demand/supply.
+    //
+    //  4. Cancel the spoof order with a variable but high probability >60 %
+    //     (drawn each cycle from SPOOF_CANCEL_RATE_MIN – SPOOF_CANCEL_RATE_MAX).
+    //     The ORDER_CANCELLED event is logged to QuestDB.
+    //
+    //  5. Immediately place the real LIMIT-IOC trade in the OPPOSITE direction
+    //     (smaller quantity SPOOF_REAL_QTY_MIN – SPOOF_REAL_QTY_MAX) at a price
+    //     slightly inside the spread so it executes against resting orders that
+    //     reacted to the artificial signal.
+    //
+    //  6. Pause SPOOF_PAUSE_MIN_MS – SPOOF_PAUSE_MAX_MS ms and repeat.
+    //
+    //  QuestDB trade_logs labels:
+    //    trader_type        = MANIPULATOR on every order/trade row from this trader
+    //    buyer_trader_type  = MANIPULATOR when this trader is the buyer leg
+    //    seller_trader_type = MANIPULATOR when this trader is the seller leg
+    // ──────────────────────────────────────────────────────────────────────────
+    void runSpoofing() {
+        std::uniform_int_distribution<size_t>  spoofQtyDist(SPOOF_LARGE_QTY_MIN,
+                                                             SPOOF_LARGE_QTY_MAX);
+        std::uniform_int_distribution<size_t>  realQtyDist(SPOOF_REAL_QTY_MIN,
+                                                            SPOOF_REAL_QTY_MAX);
+        std::uniform_int_distribution<int>     cancelWaitDist(SPOOF_CANCEL_WAIT_MIN_MS,
+                                                               SPOOF_CANCEL_WAIT_MAX_MS);
+        std::uniform_int_distribution<int>     pauseDist(SPOOF_PAUSE_MIN_MS,
+                                                          SPOOF_PAUSE_MAX_MS);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        std::uniform_real_distribution<double> cancelRateDist(SPOOF_CANCEL_RATE_MIN,
+                                                               SPOOF_CANCEL_RATE_MAX);
+
+        while (running_) {
+            // ── Sanity check: wait for a valid LTP ───────────────────────────
+            double ltp = InstrumentManager::getInstance().getLTP(instrumentId_);
+            if (ltp <= 0.0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // ── Step 1: choose spoof direction ───────────────────────────────
+            //   spoofBuy = true  → fake BUY demand, then real SELL
+            //   spoofBuy = false → fake SELL supply, then real BUY
+            bool      spoofBuy  = (uni(engine_) < 0.5);
+            OrderSide spoofSide = spoofBuy ? OrderSide::BUY  : OrderSide::SELL;
+            OrderSide realSide  = spoofBuy ? OrderSide::SELL : OrderSide::BUY;
+
+            // Spoof price: conservative — below LTP for BUY, above LTP for SELL
+            // so the order parks in the book without triggering an immediate match.
+            double spoofPrice = spoofBuy
+                ? std::round(ltp * 0.997 * 100.0) / 100.0   // BUY: 0.3% below LTP
+                : std::round(ltp * 1.003 * 100.0) / 100.0;  // SELL: 0.3% above LTP
+
+            size_t spoofQty = spoofQtyDist(engine_);
+
+            // ── Step 2: submit the large fake (spoof) order ──────────────────
+            auto spoofOrder = std::make_shared<Order>(
+                OrderType::LIMIT, spoofSide,
+                spoofPrice, spoofQty,
+                TimeInForce::GTC,   // GTC: rests in the book until cancelled
+                traderId_, instrumentId_);
+            orderBook_->addOrder(spoofOrder);
+            if (logger_) logger_->logOrder(*spoofOrder);   // → ORDER_NEW in QuestDB
+
+            // ── Step 3: let participants observe the large order ─────────────
+            int waitMs = cancelWaitDist(engine_);
+            std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+            if (!running_) break;
+
+            // ── Step 4: cancel with high but variable rate (>60 %) ───────────
+            {
+                auto status = spoofOrder->getStatus();
+                if (status == OrderStatus::NEW ||
+                    status == OrderStatus::PARTIALLY_FILLED) {
+                    double cancelRate = cancelRateDist(engine_);
+                    if (uni(engine_) < cancelRate) {
+                        orderBook_->cancelOrder(spoofOrder->getOrderId());
+                        // Log ORDER_CANCELLED to QuestDB for ML detection
+                        if (logger_ && spoofOrder->getStatus() == OrderStatus::CANCELLED)
+                            logger_->logOrder(*spoofOrder);
+                    }
+                }
+            }
+
+            if (!running_) break;
+
+            // ── Step 5: place real (opposite) trade to exploit price reaction ─
+            double freshLtp = InstrumentManager::getInstance().getLTP(instrumentId_);
+            if (freshLtp <= 0.0) freshLtp = ltp;
+
+            // Price slightly inside the spread to ensure the IOC order executes
+            // against resting counterparties that reacted to the artificial signal.
+            double realPrice = (realSide == OrderSide::SELL)
+                ? std::round(freshLtp * 0.998 * 100.0) / 100.0  // SELL: take bids
+                : std::round(freshLtp * 1.002 * 100.0) / 100.0; // BUY:  take asks
+
+            size_t realQty = realQtyDist(engine_);
+            auto realOrder = std::make_shared<Order>(
+                OrderType::LIMIT, realSide,
+                realPrice, realQty,
+                TimeInForce::IOC,   // IOC: fills immediately, drop unfilled portion
+                traderId_, instrumentId_);
+            orderBook_->addOrder(realOrder);
+            if (logger_) logger_->logOrder(*realOrder);  // → ORDER_NEW / ORDER_FILLED
+
+            // ── Step 6: pause before the next spoof cycle ────────────────────
+            std::this_thread::sleep_for(std::chrono::milliseconds(pauseDist(engine_)));
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     //  WASH TRADER  (trader #2500 only, when WASH_TRADER_ACTIVE == true)
     //
     //  Back-to-back BUY + SELL at the same price and quantity — fake volume
@@ -656,7 +832,8 @@ private:
 
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
-        if (isWashTrader_) { runWash(); return; }
+        if (isWashTrader_)  { runWash();     return; }
+        if (isSpoofTrader_) { runSpoofing(); return; }
         switch (archetype_) {
             case Archetype::MARKET_MAKER:   runMarketMaker();  break;
             case Archetype::MOMENTUM:       runMomentum();     break;
@@ -668,7 +845,8 @@ private:
     // ── Members ───────────────────────────────────────────────────────────────
     std::shared_ptr<OrderBook> orderBook_;
     std::string                traderId_;
-    bool                       isWashTrader_ = false;
+    bool                       isWashTrader_  = false;
+    bool                       isSpoofTrader_ = false;  // true for trader IDs 1–15
     Archetype                  archetype_;
     std::atomic<bool>          running_;
     std::thread                thread_;
@@ -683,6 +861,6 @@ private:
     std::vector<std::shared_ptr<Order>> pendingGTCOrders_;
 };
 
-int MockTrader::mockTraderCount = 0;
+int MockTrader::mockTraderCount = 1;  // Start at 1: IDs 1–15 are spoofing manipulators
 
 #endif // MOCK_TRADER_HPP
