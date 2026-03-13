@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <mutex>
 #include <condition_variable>
 #include "OrderBook.hpp"
@@ -111,6 +112,23 @@ static constexpr bool   SPOOFING_ACTIVE          = true;
 static constexpr int    SPOOF_MIN_USER_ID         = 1;       // first manipulator ID
 static constexpr int    SPOOF_MAX_USER_ID         = 15;      // last  manipulator ID
 
+// ── Per-1000 order cancellation controls (Normal vs Manipulator) ───────────
+// Normal traders:
+//   cancel      = 10%..15%
+//   partial of cancelled = 80%..85%   (remaining are zero-fill cancellations)
+static constexpr size_t NORMAL_CANCEL_TARGET_MIN_PER_1000  = 100;
+static constexpr size_t NORMAL_CANCEL_TARGET_MAX_PER_1000  = 150;
+static constexpr double NORMAL_PARTIAL_CANCEL_RATIO_MIN    = 0.80;
+static constexpr double NORMAL_PARTIAL_CANCEL_RATIO_MAX    = 0.85;
+
+// Manipulator (spoofing) traders:
+//   cancel      = 60%..70%
+//   partial of cancelled = 30%..40%   (remaining are zero-fill cancellations)
+static constexpr size_t SPOOF_CANCEL_TARGET_MIN_PER_1000   = 600;
+static constexpr size_t SPOOF_CANCEL_TARGET_MAX_PER_1000   = 700;
+static constexpr double SPOOF_PARTIAL_CANCEL_RATIO_MIN     = 0.30;
+static constexpr double SPOOF_PARTIAL_CANCEL_RATIO_MAX     = 0.40;
+
 // ── Spoof order (the large fake leg) ─────────────────────────────────────────
 static constexpr size_t SPOOF_LARGE_QTY_MIN       = 50000;   // min fake-order quantity
 static constexpr size_t SPOOF_LARGE_QTY_MAX       = 150000;  // max fake-order quantity
@@ -120,12 +138,10 @@ static constexpr size_t SPOOF_REAL_QTY_MIN        = 5000;    // min real-trade q
 static constexpr size_t SPOOF_REAL_QTY_MAX        = 30000;   // max real-trade quantity
 
 // ── Timing parameters ─────────────────────────────────────────────────────────
-static constexpr int    SPOOF_CANCEL_WAIT_MIN_MS  = 300;     // how long the fake order shows
-static constexpr int    SPOOF_CANCEL_WAIT_MAX_MS  = 1200;
-static constexpr double SPOOF_CANCEL_RATE_MIN     = 0.65;    // variable cancel rate, >60 %
-static constexpr double SPOOF_CANCEL_RATE_MAX     = 0.92;
-static constexpr int    SPOOF_PAUSE_MIN_MS        = 120;     // pause between spoof cycles (reduced for higher frequency)
-static constexpr int    SPOOF_PAUSE_MAX_MS        = 450;      // reduced to generate 45k-50k manipulative trades
+static constexpr int    SPOOF_CANCEL_WAIT_MIN_MS  = 150;     // tightened to increase spoof event frequency
+static constexpr int    SPOOF_CANCEL_WAIT_MAX_MS  = 520;
+static constexpr int    SPOOF_PAUSE_MIN_MS        = 40;      // shorter pause between spoof cycles
+static constexpr int    SPOOF_PAUSE_MAX_MS        = 140;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
@@ -344,6 +360,15 @@ public:
     }
 
 private:
+    struct CancelBatchState {
+        size_t ordersInBatch      = 0; // 0..1000
+        size_t cancelledInBatch   = 0;
+        size_t partialCancelled   = 0;
+        size_t zeroCancelled      = 0;
+        size_t targetCancelled    = 0;
+        size_t targetPartialCount = 0;
+    };
+
     Logger* logger_;
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -367,9 +392,11 @@ private:
         std::uniform_int_distribution<int>      typeDist(0, 3); // 0 → MARKET (25%)
 
         while (running_) {
-            // ── 52% chance to cancel one resting GTC order before placing a
-            //    new one — realistic market cancellation rate per financial market data
-            maybeCancelGTCOrder(0.52);
+            ensureBatchTarget(normalCancelState_,
+                              NORMAL_CANCEL_TARGET_MIN_PER_1000,
+                              NORMAL_CANCEL_TARGET_MAX_PER_1000,
+                              NORMAL_PARTIAL_CANCEL_RATIO_MIN,
+                              NORMAL_PARTIAL_CANCEL_RATIO_MAX);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -399,9 +426,29 @@ private:
                 orderType, side, price, qty, tif, traderId_, instrumentId_);
             orderBook_->addOrder(order);
             if (logger_) logger_->logOrder(*order);
+
+            // Count every newly submitted order toward the current 1,000-order batch.
+            ++normalCancelState_.ordersInBatch;
+
             // Track GTC LIMIT orders so they are eligible for future cancellation.
             // IOC / MARKET orders dispose of themselves and are not tracked.
             if (!isMarket) trackGTCOrder(order);
+
+            if (shouldAttemptCancellation(normalCancelState_))
+                tryCancelForBatch(normalCancelState_);
+
+            if (normalCancelState_.ordersInBatch >= 1000) {
+                // Final catch-up at the batch boundary (best effort based on currently
+                // pending orders and their live statuses).
+                while (normalCancelState_.cancelledInBatch < normalCancelState_.targetCancelled) {
+                    if (!tryCancelForBatch(normalCancelState_)) break;
+                }
+                resetBatchTargets(normalCancelState_,
+                                  NORMAL_CANCEL_TARGET_MIN_PER_1000,
+                                  NORMAL_CANCEL_TARGET_MAX_PER_1000,
+                                  NORMAL_PARTIAL_CANCEL_RATIO_MIN,
+                                  NORMAL_PARTIAL_CANCEL_RATIO_MAX);
+            }
         }
     }
 
@@ -608,8 +655,10 @@ private:
     //  3. Let the order rest for SPOOF_CANCEL_WAIT_MIN_MS – SPOOF_CANCEL_WAIT_MAX_MS
     //     milliseconds so other participants perceive the artificial demand/supply.
     //
-    //  4. Cancel the spoof order with a variable but high probability >60 %
-    //     (drawn each cycle from SPOOF_CANCEL_RATE_MIN – SPOOF_CANCEL_RATE_MAX).
+    //  4. Cancel the spoof order using enforced 1,000-order batch targets:
+    //       • cancel rate: 60%..70%
+    //       • among cancelled: 30%..40% partial-fill cancellations,
+    //                           remainder zero-fill cancellations.
     //     The ORDER_CANCELLED event is logged to QuestDB.
     //
     //  5. Immediately place the real LIMIT-IOC trade in the OPPOSITE direction
@@ -634,8 +683,12 @@ private:
         std::uniform_int_distribution<int>     pauseDist(SPOOF_PAUSE_MIN_MS,
                                                           SPOOF_PAUSE_MAX_MS);
         std::uniform_real_distribution<double> uni(0.0, 1.0);
-        std::uniform_real_distribution<double> cancelRateDist(SPOOF_CANCEL_RATE_MIN,
-                                                               SPOOF_CANCEL_RATE_MAX);
+
+        ensureBatchTarget(spoofCancelState_,
+                  SPOOF_CANCEL_TARGET_MIN_PER_1000,
+                  SPOOF_CANCEL_TARGET_MAX_PER_1000,
+                  SPOOF_PARTIAL_CANCEL_RATIO_MIN,
+                  SPOOF_PARTIAL_CANCEL_RATIO_MAX);
 
         while (running_) {
             // ── Sanity check: wait for a valid LTP ───────────────────────────
@@ -668,25 +721,57 @@ private:
                 traderId_, instrumentId_);
             orderBook_->addOrder(spoofOrder);
             if (logger_) logger_->logOrder(*spoofOrder);   // → ORDER_NEW in QuestDB
+            ++spoofCancelState_.ordersInBatch;
 
             // ── Step 3: let participants observe the large order ─────────────
             int waitMs = cancelWaitDist(engine_);
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
             if (!running_) break;
 
-            // ── Step 4: cancel with high but variable rate (>60 %) ───────────
-            {
-                auto status = spoofOrder->getStatus();
-                if (status == OrderStatus::NEW ||
-                    status == OrderStatus::PARTIALLY_FILLED) {
-                    double cancelRate = cancelRateDist(engine_);
-                    if (uni(engine_) < cancelRate) {
-                        orderBook_->cancelOrder(spoofOrder->getOrderId());
-                        // Log ORDER_CANCELLED to QuestDB for ML detection
-                        if (logger_ && spoofOrder->getStatus() == OrderStatus::CANCELLED)
-                            logger_->logOrder(*spoofOrder);
+            // ── Step 4: batch-enforced cancellation policy (60%-70%; 30%-40% partial) ──
+            if (shouldAttemptCancellation(spoofCancelState_)) {
+                bool needPartial = shouldPreferPartialCancel(spoofCancelState_);
+                auto status      = spoofOrder->getStatus();
+
+                if (needPartial && status == OrderStatus::NEW) {
+                    // Give the order extra time to become PARTIALLY_FILLED so that
+                    // partial-cancel targets are met using real matching behavior.
+                    for (int attempt = 0; attempt < 6 && running_; ++attempt) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        status = spoofOrder->getStatus();
+                        if (status == OrderStatus::PARTIALLY_FILLED ||
+                            status == OrderStatus::FILLED     ||
+                            status == OrderStatus::CANCELLED  ||
+                            status == OrderStatus::EXPIRED) {
+                            break;
+                        }
                     }
                 }
+
+                if (status == OrderStatus::NEW || status == OrderStatus::PARTIALLY_FILLED) {
+                    if ((needPartial && status == OrderStatus::PARTIALLY_FILLED) ||
+                        (!needPartial && status == OrderStatus::NEW) ||
+                        (needPartial && status == OrderStatus::NEW &&
+                         remainingPartialCancelsNeeded(spoofCancelState_) == 0) ||
+                        (!needPartial && status == OrderStatus::PARTIALLY_FILLED &&
+                         remainingZeroCancelsNeeded(spoofCancelState_) == 0)) {
+                        if (cancelAndLog(spoofOrder)) {
+                            ++spoofCancelState_.cancelledInBatch;
+                            if (status == OrderStatus::PARTIALLY_FILLED)
+                                ++spoofCancelState_.partialCancelled;
+                            else
+                                ++spoofCancelState_.zeroCancelled;
+                        }
+                    }
+                }
+            }
+
+            if (spoofCancelState_.ordersInBatch >= 1000) {
+                resetBatchTargets(spoofCancelState_,
+                                  SPOOF_CANCEL_TARGET_MIN_PER_1000,
+                                  SPOOF_CANCEL_TARGET_MAX_PER_1000,
+                                  SPOOF_PARTIAL_CANCEL_RATIO_MIN,
+                                  SPOOF_PARTIAL_CANCEL_RATIO_MAX);
             }
 
             if (!running_) break;
@@ -827,6 +912,143 @@ private:
         }
     }
 
+    void ensureBatchTarget(CancelBatchState& state,
+                           size_t minCancelPer1000,
+                           size_t maxCancelPer1000,
+                           double minPartialRatio,
+                           double maxPartialRatio) {
+        if (state.ordersInBatch == 0 && state.targetCancelled == 0)
+            resetBatchTargets(state,
+                              minCancelPer1000,
+                              maxCancelPer1000,
+                              minPartialRatio,
+                              maxPartialRatio);
+    }
+
+    void resetBatchTargets(CancelBatchState& state,
+                           size_t minCancelPer1000,
+                           size_t maxCancelPer1000,
+                           double minPartialRatio,
+                           double maxPartialRatio) {
+        std::uniform_int_distribution<size_t> cancelTargetDist(minCancelPer1000,
+                                                                maxCancelPer1000);
+        std::uniform_real_distribution<double> partialRatioDist(minPartialRatio,
+                                                                 maxPartialRatio);
+
+        state.ordersInBatch    = 0;
+        state.cancelledInBatch = 0;
+        state.partialCancelled = 0;
+        state.zeroCancelled    = 0;
+        state.targetCancelled  = cancelTargetDist(engine_);
+
+        double ratio = partialRatioDist(engine_);
+        state.targetPartialCount = static_cast<size_t>(std::llround(
+            static_cast<double>(state.targetCancelled) * ratio));
+        if (state.targetPartialCount > state.targetCancelled)
+            state.targetPartialCount = state.targetCancelled;
+    }
+
+    bool shouldAttemptCancellation(const CancelBatchState& state) {
+        if (state.cancelledInBatch >= state.targetCancelled) return false;
+        if (state.ordersInBatch == 0 || state.ordersInBatch > 1000) return false;
+
+        size_t remainingOrders   = 1000 - state.ordersInBatch + 1; // include current order
+        size_t remainingCancels  = state.targetCancelled - state.cancelledInBatch;
+        if (remainingCancels >= remainingOrders) return true;
+
+        std::uniform_real_distribution<double> gate(0.0, 1.0);
+        double mustCancelProb = static_cast<double>(remainingCancels) /
+                                static_cast<double>(remainingOrders);
+        return gate(engine_) < mustCancelProb;
+    }
+
+    size_t remainingPartialCancelsNeeded(const CancelBatchState& state) const {
+        if (state.partialCancelled >= state.targetPartialCount) return 0;
+        return state.targetPartialCount - state.partialCancelled;
+    }
+
+    size_t remainingZeroCancelsNeeded(const CancelBatchState& state) const {
+        size_t targetZero = state.targetCancelled - state.targetPartialCount;
+        if (state.zeroCancelled >= targetZero) return 0;
+        return targetZero - state.zeroCancelled;
+    }
+
+    bool shouldPreferPartialCancel(const CancelBatchState& state) const {
+        size_t needPartial = remainingPartialCancelsNeeded(state);
+        size_t needZero    = remainingZeroCancelsNeeded(state);
+        if (needPartial == 0) return false;
+        if (needZero == 0) return true;
+        return needPartial >= needZero;
+    }
+
+    bool cancelAndLog(const std::shared_ptr<Order>& order) {
+        if (!order) return false;
+        auto status = order->getStatus();
+        if (status != OrderStatus::NEW && status != OrderStatus::PARTIALLY_FILLED)
+            return false;
+
+        orderBook_->cancelOrder(order->getOrderId());
+        if (order->getStatus() == OrderStatus::CANCELLED) {
+            if (logger_) logger_->logOrder(*order);
+            return true;
+        }
+        return false;
+    }
+
+    std::shared_ptr<Order> pickPendingOrderByStatus(OrderStatus desiredStatus) {
+        cleanupPendingOrders();
+        std::vector<size_t> candidates;
+        candidates.reserve(pendingGTCOrders_.size());
+        for (size_t i = 0; i < pendingGTCOrders_.size(); ++i) {
+            const auto& order = pendingGTCOrders_[i];
+            if (!order) continue;
+            if (order->getStatus() == desiredStatus)
+                candidates.push_back(i);
+        }
+        if (candidates.empty()) return nullptr;
+        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
+        return pendingGTCOrders_[candidates[pick(engine_)]];
+    }
+
+    void cleanupPendingOrders() {
+        pendingGTCOrders_.erase(
+            std::remove_if(pendingGTCOrders_.begin(), pendingGTCOrders_.end(),
+                [](const std::shared_ptr<Order>& o) {
+                    if (!o) return true;
+                    const auto s = o->getStatus();
+                    return s == OrderStatus::FILLED   ||
+                           s == OrderStatus::CANCELLED ||
+                           s == OrderStatus::EXPIRED;
+                }),
+            pendingGTCOrders_.end());
+    }
+
+    bool tryCancelForBatch(CancelBatchState& state) {
+        cleanupPendingOrders();
+        if (pendingGTCOrders_.empty()) return false;
+
+        std::shared_ptr<Order> order;
+        bool needPartial = shouldPreferPartialCancel(state);
+        if (needPartial) {
+            order = pickPendingOrderByStatus(OrderStatus::PARTIALLY_FILLED);
+            if (!order) order = pickPendingOrderByStatus(OrderStatus::NEW);
+        } else {
+            order = pickPendingOrderByStatus(OrderStatus::NEW);
+            if (!order) order = pickPendingOrderByStatus(OrderStatus::PARTIALLY_FILLED);
+        }
+        if (!order) return false;
+
+        auto statusBeforeCancel = order->getStatus();
+        if (!cancelAndLog(order)) return false;
+
+        ++state.cancelledInBatch;
+        if (statusBeforeCancel == OrderStatus::PARTIALLY_FILLED)
+            ++state.partialCancelled;
+        else
+            ++state.zeroCancelled;
+        return true;
+    }
+
     // Dispatch to the correct primary behaviour for this trader.
     void run() {
         if (isWashTrader_)  { runWash();     return; }
@@ -852,6 +1074,9 @@ private:
     std::uniform_real_distribution<double> washPriceJitter_; // ±0.1% for wash trades
 
     int instrumentId_;
+
+    CancelBatchState normalCancelState_;
+    CancelBatchState spoofCancelState_;
 
     // Tracks placed GTC LIMIT orders eligible for future cancellation.
     // Single-threaded per MockTrader instance — no extra locking required.
