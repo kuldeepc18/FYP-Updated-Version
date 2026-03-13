@@ -5,6 +5,10 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
@@ -112,6 +116,23 @@ static const int CIRCULAR_RING_IDS[4] = {2500, 2600, 2700, 2800};
 static constexpr bool   LAYERING_ACTIVE        = true;
 static constexpr int    LAYERING_MANIP_COUNT   = 15;     // one per instrument (ids 1–15)
 
+// ── Cancellation-policy targets requested for dataset realism ───────────────
+// Normal traders:
+//   cancel rate         : 20–25%
+//   among cancellations : 80–85% partial-cancel, 15–20% zero-fill cancel
+static constexpr double NORMAL_CANCEL_RATE_MIN          = 0.20;
+static constexpr double NORMAL_CANCEL_RATE_MAX          = 0.25;
+static constexpr double NORMAL_PARTIAL_CANCEL_SHARE_MIN = 0.80;
+static constexpr double NORMAL_PARTIAL_CANCEL_SHARE_MAX = 0.85;
+
+// Manipulator traders (layering ids 1–15):
+//   cancel rate         : 60–70%
+//   among cancellations : 30–40% partial-cancel, 60–70% zero-fill cancel
+static constexpr double MANIP_CANCEL_RATE_MIN           = 0.60;
+static constexpr double MANIP_CANCEL_RATE_MAX           = 0.70;
+static constexpr double MANIP_PARTIAL_CANCEL_SHARE_MIN  = 0.30;
+static constexpr double MANIP_PARTIAL_CANCEL_SHARE_MAX  = 0.40;
+
 // Fake (spoofed) layering order parameters
 static constexpr size_t LAYERING_QTY_MIN       = 20000;  // shares per fake level
 static constexpr size_t LAYERING_QTY_MAX       = 80000;
@@ -130,6 +151,119 @@ static constexpr size_t LAYERING_PROFIT_QTY    = 3000;   // shares — smaller t
 // Idle time between layering burst cycles
 static constexpr int    LAYERING_PAUSE_MIN_MS  = 120;    // 120 ms minimum between bursts
 static constexpr int    LAYERING_PAUSE_MAX_MS  = 420;    // 420 ms maximum between bursts
+
+class CancellationMixController {
+public:
+    CancellationMixController(double cancelMin,
+                              double cancelMax,
+                              double partialMin,
+                              double partialMax)
+        : cancelMin_(cancelMin)
+        , cancelMax_(cancelMax)
+        , partialMin_(partialMin)
+        , partialMax_(partialMax)
+    {}
+
+    void recordPlaced() {
+        placed_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordCancelled(bool partialCancelled) {
+        cancelled_.fetch_add(1, std::memory_order_relaxed);
+        if (partialCancelled) partialCancelled_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool shouldAttemptCancel(std::mt19937& eng, double baseProbability) const {
+        const double cancelRate = currentCancelRate();
+        if (cancelRate < cancelMin_) return true;
+        if (cancelRate > cancelMax_) return false;
+
+        const double target = 0.5 * (cancelMin_ + cancelMax_);
+        double adaptive = baseProbability + (target - cancelRate) * 2.0;
+        adaptive = std::max(0.01, std::min(0.99, adaptive));
+
+        std::uniform_real_distribution<double> gate(0.0, 1.0);
+        return gate(eng) < adaptive;
+    }
+
+    bool preferPartialCancel(std::mt19937& eng) const {
+        const double partialShare = currentPartialCancelledShare();
+        if (partialShare < partialMin_) return true;
+        if (partialShare > partialMax_) return false;
+
+        const double target = 0.5 * (partialMin_ + partialMax_);
+        double adaptive = 0.5 + (target - partialShare);
+        adaptive = std::max(0.05, std::min(0.95, adaptive));
+        std::uniform_real_distribution<double> gate(0.0, 1.0);
+        return gate(eng) < adaptive;
+    }
+
+    bool isBelowCancelFloor() const {
+        return currentCancelRate() < cancelMin_;
+    }
+
+private:
+    double currentCancelRate() const {
+        const auto placed = placed_.load(std::memory_order_relaxed);
+        if (placed == 0) return 0.0;
+        const auto cancelled = cancelled_.load(std::memory_order_relaxed);
+        return static_cast<double>(cancelled) / static_cast<double>(placed);
+    }
+
+    double currentPartialCancelledShare() const {
+        const auto cancelled = cancelled_.load(std::memory_order_relaxed);
+        if (cancelled == 0) return 0.0;
+        const auto partialCancelled = partialCancelled_.load(std::memory_order_relaxed);
+        return static_cast<double>(partialCancelled) / static_cast<double>(cancelled);
+    }
+
+    double               cancelMin_;
+    double               cancelMax_;
+    double               partialMin_;
+    double               partialMax_;
+    std::atomic<uint64_t> placed_{0};
+    std::atomic<uint64_t> cancelled_{0};
+    std::atomic<uint64_t> partialCancelled_{0};
+};
+
+inline CancellationMixController& normalCancellationPolicy() {
+    static CancellationMixController policy(
+        NORMAL_CANCEL_RATE_MIN,
+        NORMAL_CANCEL_RATE_MAX,
+        NORMAL_PARTIAL_CANCEL_SHARE_MIN,
+        NORMAL_PARTIAL_CANCEL_SHARE_MAX);
+    return policy;
+}
+
+inline CancellationMixController& manipCancellationPolicy() {
+    static CancellationMixController policy(
+        MANIP_CANCEL_RATE_MIN,
+        MANIP_CANCEL_RATE_MAX,
+        MANIP_PARTIAL_CANCEL_SHARE_MIN,
+        MANIP_PARTIAL_CANCEL_SHARE_MAX);
+    return policy;
+}
+
+inline bool isLayeringManipulatorTraderId(const std::string& traderId) {
+    if (traderId.empty()) return false;
+    char* end = nullptr;
+    const long id = std::strtol(traderId.c_str(), &end, 10);
+    return (end != traderId.c_str() && *end == '\0' && id >= 1 && id <= 15);
+}
+
+inline CancellationMixController& cancellationPolicyForTrader(const std::string& traderId) {
+    return isLayeringManipulatorTraderId(traderId)
+        ? manipCancellationPolicy()
+        : normalCancellationPolicy();
+}
+
+inline void recordOrderPlacedForTrader(const std::string& traderId) {
+    cancellationPolicyForTrader(traderId).recordPlaced();
+}
+
+inline void recordOrderCancelledForTrader(const std::string& traderId, bool wasPartialBeforeCancel) {
+    cancellationPolicyForTrader(traderId).recordCancelled(wasPartialBeforeCancel);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
@@ -402,8 +536,17 @@ private:
             for (int lvl = 1; lvl <= levels; ++lvl) {
                 if (!running_) break;
 
-                const double gap   = gapDist(eng);             // 0.2–0.8 % per level
-                const size_t qty   = qtyDist(eng);             // 20 000–80 000 shares
+                // First few levels are closer to touch with smaller size to
+                // naturally create PARTIAL / FILLED transitions; deeper levels
+                // remain farther and larger so NEW→EXPIRED and NEW→CANCELLED
+                // paths also occur.
+                const bool nearTouch = (lvl <= 3);
+                const double gap = nearTouch
+                    ? std::uniform_real_distribution<double>(0.0002, 0.0012)(eng)
+                    : gapDist(eng);                             // 0.2–0.8 % deeper levels
+                const size_t qty = nearTouch
+                    ? std::uniform_int_distribution<size_t>(5000, 20000)(eng)
+                    : qtyDist(eng);                             // 20 000–80 000 shares
                 double       price;
                 OrderSide    side;
 
@@ -423,6 +566,7 @@ private:
                     TimeInForce::GTC, userId, instrId);
 
                 ob->addOrder(order);
+                recordOrderPlacedForTrader(userId);
                 // Log ORDER_NEW immediately — fake order is now visible in the book
                 if (logger_) logger_->logOrder(*order);
                 layeringOrders.push_back(order);
@@ -435,7 +579,7 @@ private:
                 std::chrono::milliseconds(cancelDist(eng)));
 
             // ── 5. Cancel all fake orders ─────────────────────────────────────
-            cancelLayeringOrders(ob, layeringOrders);
+            cancelLayeringOrders(ob, layeringOrders, userId, eng);
             if (!running_) break;
 
             // ── 6. Profit trade — small opposite-side LIMIT-IOC ───────────────
@@ -461,6 +605,7 @@ private:
                 TimeInForce::IOC, userId, instrId);
 
             ob->addOrder(profitOrder);
+            recordOrderPlacedForTrader(userId);
             // logOrder() will capture the final status (FILLED, PARTIALLY_FILLED,
             // or CANCELLED-by-IOC if no counterparty was found).
             if (logger_) logger_->logOrder(*profitOrder);
@@ -469,19 +614,42 @@ private:
 
     // ── Cancel all still-pending layering orders and log ORDER_CANCELLED ──────
     void cancelLayeringOrders(
-        const std::shared_ptr<OrderBook>&         ob,
-        const std::vector<std::shared_ptr<Order>>& orders)
+        const std::shared_ptr<OrderBook>&          ob,
+        const std::vector<std::shared_ptr<Order>>& orders,
+        const std::string&                         userId,
+        std::mt19937&                              eng)
     {
-        for (const auto& order : orders) {
+        std::vector<std::shared_ptr<Order>> shuffled = orders;
+        std::shuffle(shuffled.begin(), shuffled.end(), eng);
+
+        auto& policy = cancellationPolicyForTrader(userId);
+        size_t pendingPartial = 0;
+        size_t pendingZero    = 0;
+        for (const auto& order : shuffled) {
             if (!order) continue;
             const auto s = order->getStatus();
-            if (s == OrderStatus::NEW || s == OrderStatus::PARTIALLY_FILLED) {
-                ob->cancelOrder(order->getOrderId());
-                // order->cancel() has been called inside cancelOrder() —
-                // the shared_ptr still points to the same object with
-                // status = CANCELLED and a valid cancelTimestamp.
-                if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
-                    logger_->logOrder(*order);
+            if (s == OrderStatus::PARTIALLY_FILLED) ++pendingPartial;
+            else if (s == OrderStatus::NEW) ++pendingZero;
+        }
+
+        for (const auto& order : shuffled) {
+            if (!order) continue;
+            const auto s = order->getStatus();
+            if (s != OrderStatus::NEW && s != OrderStatus::PARTIALLY_FILLED) continue;
+
+            if (!policy.shouldAttemptCancel(eng, 0.65)) continue;
+
+            const bool preferPartial = policy.preferPartialCancel(eng);
+            if (preferPartial && s != OrderStatus::PARTIALLY_FILLED && pendingPartial > 0) continue;
+            if (!preferPartial && s != OrderStatus::NEW && pendingZero > 0) continue;
+
+            const bool wasPartialBeforeCancel = (s == OrderStatus::PARTIALLY_FILLED);
+            ob->cancelOrder(order->getOrderId());
+            if (order->getStatus() == OrderStatus::CANCELLED) {
+                recordOrderCancelledForTrader(userId, wasPartialBeforeCancel);
+                if (wasPartialBeforeCancel && pendingPartial > 0) --pendingPartial;
+                if (!wasPartialBeforeCancel && pendingZero > 0) --pendingZero;
+                if (logger_) logger_->logOrder(*order);
             }
         }
     }
@@ -549,6 +717,60 @@ private:
     Logger* logger_;
 
     // ──────────────────────────────────────────────────────────────────────────
+    //  Lifecycle diversity for NORMAL traders (ids >= 16)
+    //
+    //  Produces a random mix of realistic order paths:
+    //    NEW -> PARTIAL -> CANCELLED     (handled by cancellation policy)
+    //    NEW -> PARTIAL -> EXPIRED       (passive+large GTC near touch)
+    //    NEW -> EXPIRED                  (deep passive GTC)
+    //    NEW -> FILLED                   (aggressive IOC)
+    //    NEW -> PARTIAL -> FILLED        (aggressive large GTC)
+    //
+    //  No synthetic status mutation is used; outcomes come from real matching,
+    //  cancellation, and expiry threads.
+    // ──────────────────────────────────────────────────────────────────────────
+    void applyNormalLifecycleDiversity(OrderSide side,
+                                       double ltp,
+                                       double& price,
+                                       TimeInForce& tif,
+                                       size_t& qty)
+    {
+        if (isLayeringManipulatorTraderId(traderId_)) return;
+
+        std::uniform_real_distribution<double> choice(0.0, 1.0);
+        const double r = choice(engine_);
+
+        // ~8%: deep passive order likely to remain unmatched and EXPIRE.
+        if (r < 0.08) {
+            tif = TimeInForce::GTC;
+            if (side == OrderSide::BUY) price = ltp * 0.94;
+            else                        price = ltp * 1.06;
+            qty = std::max<size_t>(qty, 80);
+            return;
+        }
+
+        // ~8%: larger near-touch resting order, often partial then EXPIRED.
+        if (r < 0.16) {
+            tif = TimeInForce::GTC;
+            if (side == OrderSide::BUY) price = ltp * 0.998;
+            else                        price = ltp * 1.002;
+            qty = std::max<size_t>(qty * 4, 120);
+            return;
+        }
+
+        // ~30%: aggressive IOC, mostly NEW->FILLED (or partial immediate fill).
+        if (r < 0.46) {
+            tif = TimeInForce::IOC;
+            if (side == OrderSide::BUY) price = ltp * 1.004;
+            else                        price = ltp * 0.996;
+            qty = std::max<size_t>(qty, 20);
+            return;
+        }
+
+        // Remaining cases keep archetype-native behavior.
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     //  NOISE TRADER  (120 per instrument, 60%)
     //
     //  Enhanced retail trader that:
@@ -598,9 +820,11 @@ private:
             }
 
             auto qty   = qtyDist(engine_);
+            applyNormalLifecycleDiversity(side, ltp, price, tif, qty);
             auto order = std::make_shared<Order>(
                 orderType, side, price, qty, tif, traderId_, instrumentId_);
             orderBook_->addOrder(order);
+            recordOrderPlacedForTrader(traderId_);
             if (logger_) logger_->logOrder(*order);
             // Track GTC LIMIT orders so they are eligible for future cancellation.
             // IOC / MARKET orders dispose of themselves and are not tracked.
@@ -659,14 +883,18 @@ private:
             double actualDir = (side == OrderSide::BUY) ? 1.0 : -1.0;
             double price     = ltp * (1.0 + actualDir * 0.003);
             auto   qty       = qtyDist(engine_);
+            TimeInForce tif  = TimeInForce::GTC;
+
+            applyNormalLifecycleDiversity(side, ltp, price, tif, qty);
 
             auto order = std::make_shared<Order>(
                 OrderType::LIMIT, side, price, qty,
-                TimeInForce::GTC, traderId_, instrumentId_);
+                tif, traderId_, instrumentId_);
             orderBook_->addOrder(order);
+            recordOrderPlacedForTrader(traderId_);
             if (logger_) logger_->logOrder(*order);
             // Track for future cancellation when the trend reverses.
-            trackGTCOrder(order);
+            if (tif == TimeInForce::GTC) trackGTCOrder(order);
         }
     }
 
@@ -724,14 +952,18 @@ private:
             auto qty       = qtyDist(engine_);
             // Price converges toward the rolling average (mean-reverting anchor)
             double price = (side == OrderSide::BUY) ? targetPrice * 1.001 : targetPrice * 0.999;
+            TimeInForce tif = TimeInForce::GTC;
+
+            applyNormalLifecycleDiversity(side, ltp, price, tif, qty);
 
             auto order = std::make_shared<Order>(
                 OrderType::LIMIT, side, price, qty,
-                TimeInForce::GTC, traderId_, instrumentId_);
+                tif, traderId_, instrumentId_);
             orderBook_->addOrder(order);
+            recordOrderPlacedForTrader(traderId_);
             if (logger_) logger_->logOrder(*order);
             // Track for future cancellation when the mean shifts.
-            trackGTCOrder(order);
+            if (tif == TimeInForce::GTC) trackGTCOrder(order);
         }
     }
 
@@ -780,6 +1012,7 @@ private:
                 ltp * (1.0 - halfSpread), qty,
                 TimeInForce::GTC, traderId_, instrumentId_);
             orderBook_->addOrder(buyOrder);
+            recordOrderPlacedForTrader(traderId_);
             if (logger_) logger_->logOrder(*buyOrder);
             // Track the new bid so it can be cancelled on the next iteration.
             trackGTCOrder(buyOrder);
@@ -790,6 +1023,7 @@ private:
                 ltp * (1.0 + halfSpread), qty,
                 TimeInForce::GTC, traderId_, instrumentId_);
             orderBook_->addOrder(sellOrder);
+            recordOrderPlacedForTrader(traderId_);
             if (logger_) logger_->logOrder(*sellOrder);
             // Track the new ask so it can be cancelled on the next iteration.
             trackGTCOrder(sellOrder);
@@ -818,6 +1052,7 @@ private:
                     washPrice, WASH_QUANTITY,
                     TimeInForce::GTC, traderId_, instrumentId_);
                 orderBook_->addOrder(buyOrder);
+                recordOrderPlacedForTrader(traderId_);
                 if (logger_) logger_->logOrder(*buyOrder);
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(WASH_INTERVAL_MS));
@@ -829,6 +1064,7 @@ private:
                     WASH_QUANTITY,  // same qty   — red flag ✦
                     TimeInForce::GTC, traderId_, instrumentId_);
                 orderBook_->addOrder(sellOrder);
+                recordOrderPlacedForTrader(traderId_);
                 if (logger_) logger_->logOrder(*sellOrder);
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(WASH_INTERVAL_MS));
@@ -861,8 +1097,9 @@ private:
     void trackGTCOrder(const std::shared_ptr<Order>& order) {
         if (!order || order->getTimeInForce() == TimeInForce::IOC) return;
         pendingGTCOrders_.push_back(order);
-        // Hard cap: keep at most 20 candidates to bound memory.
-        if (pendingGTCOrders_.size() > 20)
+        // Hard cap: keep at most 60 candidates to improve cancellation
+        // opportunity density while still bounding memory.
+        if (pendingGTCOrders_.size() > 60)
             pendingGTCOrders_.erase(pendingGTCOrders_.begin());
     }
 
@@ -885,19 +1122,42 @@ private:
 
         if (pendingGTCOrders_.empty()) return;
 
-        // Step 2 — random gate: skip most iterations so the cancel rate stays
-        //          proportional to the archetype's natural order-placement rate.
-        std::uniform_real_distribution<double> gate(0.0, 1.0);
-        if (gate(engine_) >= probability) return;
+        auto& policy = cancellationPolicyForTrader(traderId_);
 
         // Step 3 — cancel a bounded number of randomly selected pending orders.
-        const size_t attempts = std::min(maxCancels, pendingGTCOrders_.size());
+        // If current cancel rate is below floor, temporarily increase attempts
+        // to steer back toward target range faster.
+        const size_t dynamicMaxCancels = maxCancels + (policy.isBelowCancelFloor() ? 2 : 0);
+        const size_t attempts = std::min(dynamicMaxCancels, pendingGTCOrders_.size());
         for (size_t i = 0; i < attempts; ++i) {
             if (pendingGTCOrders_.empty()) break;
-            std::uniform_int_distribution<size_t> pick(0, pendingGTCOrders_.size() - 1);
-            const size_t idx = pick(engine_);
-            auto order = pendingGTCOrders_[idx];
-            pendingGTCOrders_[idx] = pendingGTCOrders_.back();
+            if (!policy.shouldAttemptCancel(engine_, probability)) break;
+
+            std::vector<size_t> partialIdx;
+            std::vector<size_t> zeroIdx;
+            partialIdx.reserve(pendingGTCOrders_.size());
+            zeroIdx.reserve(pendingGTCOrders_.size());
+            for (size_t idx = 0; idx < pendingGTCOrders_.size(); ++idx) {
+                const auto& cand = pendingGTCOrders_[idx];
+                if (!cand) continue;
+                const auto st = cand->getStatus();
+                if (st == OrderStatus::PARTIALLY_FILLED) partialIdx.push_back(idx);
+                else if (st == OrderStatus::NEW) zeroIdx.push_back(idx);
+            }
+
+            if (partialIdx.empty() && zeroIdx.empty()) break;
+
+            const bool wantPartial = policy.preferPartialCancel(engine_);
+            const std::vector<size_t>* source = nullptr;
+            if (wantPartial && !partialIdx.empty()) source = &partialIdx;
+            else if (!wantPartial && !zeroIdx.empty()) source = &zeroIdx;
+            else if (!partialIdx.empty()) source = &partialIdx;
+            else source = &zeroIdx;
+
+            std::uniform_int_distribution<size_t> pickVec(0, source->size() - 1);
+            const size_t pickedPos = (*source)[pickVec(engine_)];
+            auto order = pendingGTCOrders_[pickedPos];
+            pendingGTCOrders_[pickedPos] = pendingGTCOrders_.back();
             pendingGTCOrders_.pop_back();
 
             if (!order) continue;
@@ -911,8 +1171,11 @@ private:
                 // After the call the shared_ptr still points to the same Order object
                 // whose status is now CANCELLED — log it to produce ORDER_CANCELLED
                 // in QuestDB trade_logs.
-                if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
-                    logger_->logOrder(*order);
+                if (order->getStatus() == OrderStatus::CANCELLED) {
+                    const bool wasPartialBeforeCancel = (s == OrderStatus::PARTIALLY_FILLED);
+                    recordOrderCancelledForTrader(traderId_, wasPartialBeforeCancel);
+                    if (logger_) logger_->logOrder(*order);
+                }
             }
         }
     }
