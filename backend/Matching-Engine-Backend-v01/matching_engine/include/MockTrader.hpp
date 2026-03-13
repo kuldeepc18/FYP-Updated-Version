@@ -115,21 +115,21 @@ static constexpr int    LAYERING_MANIP_COUNT   = 15;     // one per instrument (
 // Fake (spoofed) layering order parameters
 static constexpr size_t LAYERING_QTY_MIN       = 20000;  // shares per fake level
 static constexpr size_t LAYERING_QTY_MAX       = 80000;
-static constexpr int    LAYERING_LEVELS_MIN    = 3;      // price levels per burst
-static constexpr int    LAYERING_LEVELS_MAX    = 7;
+static constexpr int    LAYERING_LEVELS_MIN    = 12;     // price levels per burst
+static constexpr int    LAYERING_LEVELS_MAX    = 20;
 static constexpr double LAYERING_GAP_MIN       = 0.002;  // 0.2 % gap between levels
 static constexpr double LAYERING_GAP_MAX       = 0.008;  // 0.8 % gap between levels
 
 // Spoof window — how long fake orders remain in the book before cancellation
-static constexpr int    LAYERING_CANCEL_MIN_MS = 100;    // 100 ms minimum
-static constexpr int    LAYERING_CANCEL_MAX_MS = 3000;   // 3 s maximum
+static constexpr int    LAYERING_CANCEL_MIN_MS = 80;     // 80 ms minimum
+static constexpr int    LAYERING_CANCEL_MAX_MS = 260;    // 260 ms maximum
 
 // Profit trade placed on the opposite side after cancelling fake orders
 static constexpr size_t LAYERING_PROFIT_QTY    = 3000;   // shares — smaller than fake orders
 
 // Idle time between layering burst cycles
-static constexpr int    LAYERING_PAUSE_MIN_MS  = 3000;   // 3 s minimum between bursts
-static constexpr int    LAYERING_PAUSE_MAX_MS  = 8000;   // 8 s maximum between bursts
+static constexpr int    LAYERING_PAUSE_MIN_MS  = 120;    // 120 ms minimum between bursts
+static constexpr int    LAYERING_PAUSE_MAX_MS  = 420;    // 420 ms maximum between bursts
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CircularRingCoordinator
@@ -572,7 +572,7 @@ private:
             // ── 15% chance to cancel one resting GTC order before placing a
             //    new one — retail traders regularly change their minds or adjust
             //    to news, creating realistic ORDER_CANCELLED events.
-            maybeCancelGTCOrder(0.15);
+            maybeCancelGTCOrder(0.45, 2);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -630,7 +630,7 @@ private:
             // ── 12% chance to cancel a pending order that may now be against
             //    the updated trend direction — a realistic momentum-trader
             //    risk-management step before reassessing the market.
-            maybeCancelGTCOrder(0.12);
+            maybeCancelGTCOrder(0.40, 2);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -691,7 +691,7 @@ private:
             // ── 10% chance to cancel a resting order whose price may now be
             //    far from the updated rolling mean — mean-reversion traders
             //    cull stale orders whenever the mean shifts significantly.
-            maybeCancelGTCOrder(0.10);
+            maybeCancelGTCOrder(0.35, 2);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepDist(engine_)));
 
@@ -769,7 +769,7 @@ private:
             // Probability 0.80: on 4 out of 5 iterations all old quotes are
             // cancelled; the remaining 1 in 5 lets a quote stay to simulate
             // deliberate passive resting (adds realism without being 100%).
-            maybeCancelGTCOrder(0.80);
+            maybeCancelGTCOrder(0.95, 4);
 
             double ltp = InstrumentManager::getInstance().getLTP(instrumentId_);
             auto   qty = qtyDist(engine_);
@@ -867,9 +867,10 @@ private:
     }
 
     // Purge orders that are no longer cancellable (FILLED / CANCELLED / EXPIRED),
-    // then cancel one randomly chosen pending GTC order with the given probability.
+    // then cancel up to maxCancels randomly chosen pending GTC orders with the
+    // given probability.
     // The cancelled order is immediately logged to QuestDB as ORDER_CANCELLED.
-    void maybeCancelGTCOrder(double probability) {
+    void maybeCancelGTCOrder(double probability, size_t maxCancels = 1) {
         // Step 1 — remove orders that have already been resolved.
         pendingGTCOrders_.erase(
             std::remove_if(pendingGTCOrders_.begin(), pendingGTCOrders_.end(),
@@ -889,22 +890,30 @@ private:
         std::uniform_real_distribution<double> gate(0.0, 1.0);
         if (gate(engine_) >= probability) return;
 
-        // Step 3 — pick one pending order at random and cancel it.
-        std::uniform_int_distribution<size_t> pick(0, pendingGTCOrders_.size() - 1);
-        auto order = pendingGTCOrders_[pick(engine_)];
-        if (!order) return;
+        // Step 3 — cancel a bounded number of randomly selected pending orders.
+        const size_t attempts = std::min(maxCancels, pendingGTCOrders_.size());
+        for (size_t i = 0; i < attempts; ++i) {
+            if (pendingGTCOrders_.empty()) break;
+            std::uniform_int_distribution<size_t> pick(0, pendingGTCOrders_.size() - 1);
+            const size_t idx = pick(engine_);
+            auto order = pendingGTCOrders_[idx];
+            pendingGTCOrders_[idx] = pendingGTCOrders_.back();
+            pendingGTCOrders_.pop_back();
 
-        const auto s = order->getStatus();
-        if (s == OrderStatus::NEW || s == OrderStatus::PARTIALLY_FILLED) {
-            // cancelOrder() acquires the book mutex, removes the order from the
-            // price level map, and calls order->cancel() which stamps the cancel
-            // timestamp and sets status = CANCELLED.
-            orderBook_->cancelOrder(order->getOrderId());
-            // After the call the shared_ptr still points to the same Order object
-            // whose status is now CANCELLED — log it to produce ORDER_CANCELLED
-            // in QuestDB trade_logs.
-            if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
-                logger_->logOrder(*order);
+            if (!order) continue;
+
+            const auto s = order->getStatus();
+            if (s == OrderStatus::NEW || s == OrderStatus::PARTIALLY_FILLED) {
+                // cancelOrder() acquires the book mutex, removes the order from the
+                // price level map, and calls order->cancel() which stamps the cancel
+                // timestamp and sets status = CANCELLED.
+                orderBook_->cancelOrder(order->getOrderId());
+                // After the call the shared_ptr still points to the same Order object
+                // whose status is now CANCELLED — log it to produce ORDER_CANCELLED
+                // in QuestDB trade_logs.
+                if (logger_ && order->getStatus() == OrderStatus::CANCELLED)
+                    logger_->logOrder(*order);
+            }
         }
     }
 
