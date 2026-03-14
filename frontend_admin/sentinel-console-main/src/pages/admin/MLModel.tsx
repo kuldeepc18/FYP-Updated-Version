@@ -1,8 +1,34 @@
-import { mlModelStatus } from "@/data/mockMarketData";
 import { cn } from "@/lib/utils";
 import { Database, Cpu, CheckCircle2, Clock, AlertCircle } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+
+type OutputFormat = "json" | "csv" | "xlsx";
+type PredictionValue = string | number | boolean | null;
+type PredictionRow = Record<string, PredictionValue>;
+
+const resolveDefaultMlApiBase = () => {
+  if (typeof window === "undefined") {
+    return "http://127.0.0.1:8000";
+  }
+  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+  return `${protocol}//${window.location.hostname}:8000`;
+};
+
+const ML_API_BASE =
+  (import.meta.env.VITE_ML_API_URL as string | undefined)?.replace(/\/$/, "") ||
+  resolveDefaultMlApiBase();
 
 export default function MLModel() {
+  const [singleFile, setSingleFile] = useState<File | null>(null);
+  const [layeringFile, setLayeringFile] = useState<File | null>(null);
+  const [spoofingFile, setSpoofingFile] = useState<File | null>(null);
+  const [responseFormat, setResponseFormat] = useState<OutputFormat>("xlsx");
+  const [isSingleLoading, setIsSingleLoading] = useState(false);
+  const [isCombinedLoading, setIsCombinedLoading] = useState(false);
+  const [requestError, setRequestError] = useState<string>("");
+  const [predictionRows, setPredictionRows] = useState<PredictionRow[]>([]);
+  const [mlApiHealthy, setMlApiHealthy] = useState<boolean | null>(null);
+
   const formatDate = (isoString: string) => {
     return new Date(isoString).toLocaleString("en-US", {
       year: "numeric",
@@ -17,6 +43,213 @@ export default function MLModel() {
     return new Intl.NumberFormat("en-US").format(num);
   };
 
+  const predictionColumns = useMemo(() => {
+    if (!predictionRows.length) return [] as string[];
+    return Object.keys(predictionRows[0]);
+  }, [predictionRows]);
+
+  const manipulators = useMemo(() => {
+    return predictionRows.filter((row) => String(row.predicted_trader_type) === "1");
+  }, [predictionRows]);
+
+  const manipulatorUserIds = useMemo(() => {
+    const ids = manipulators
+      .map((row) => row.user_id)
+      .filter((value) => value !== null && value !== undefined)
+      .map((value) => String(value));
+    return ids.join(", ");
+  }, [manipulators]);
+
+  const liveModelStatus = useMemo(() => {
+    const nowIso = new Date().toISOString();
+    const manipulatorRatio = predictionRows.length
+      ? (manipulators.length / predictionRows.length) * 100
+      : 0;
+    return {
+      currentModel: "Live Prediction Service",
+      status: mlApiHealthy ? "READY" : mlApiHealthy === false ? "OFFLINE" : "CONNECTING",
+      progress: mlApiHealthy ? 100 : 0,
+      lastTraining: nowIso,
+      nextScheduled: nowIso,
+      datasetSize: predictionRows.length,
+      accuracy: predictionRows.length ? (100 - manipulatorRatio).toFixed(1) : "—",
+      precision: predictionRows.length ? (100 - manipulatorRatio).toFixed(1) : "—",
+      recall: predictionRows.length ? manipulatorRatio.toFixed(1) : "—",
+      f1Score: predictionRows.length ? (100 - manipulatorRatio / 2).toFixed(1) : "—",
+    };
+  }, [mlApiHealthy, predictionRows.length, manipulators.length]);
+
+  useEffect(() => {
+    let mounted = true;
+    const probeHealth = async () => {
+      try {
+        const response = await fetch(`${ML_API_BASE}/health`);
+        if (!mounted) return;
+        setMlApiHealthy(response.ok);
+      } catch {
+        if (!mounted) return;
+        setMlApiHealthy(false);
+      }
+    };
+
+    probeHealth();
+    const timer = setInterval(probeHealth, 10000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const formatCellValue = (value: PredictionValue) => {
+    if (value === null || value === undefined) return "";
+    return String(value);
+  };
+
+  const parsePredictionPayload = async (response: Response): Promise<PredictionRow[]> => {
+    const contentType = response.headers.get("content-type") || "";
+    const rawText = await response.text();
+    if (!response.ok) {
+      throw new Error(rawText || `Request failed with status ${response.status}`);
+    }
+
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON preview response, got ${contentType || "unknown type"}`);
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      throw new Error(`Invalid JSON preview response: ${rawText.slice(0, 200)}`);
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Preview response is empty.");
+    }
+
+    const records = (parsed as { predictions?: unknown }).predictions;
+    if (!Array.isArray(records)) {
+      throw new Error("Preview response missing 'predictions' array.");
+    }
+
+    return records as PredictionRow[];
+  };
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  };
+
+  const normalizeRequestError = (error: unknown, fallback: string) => {
+    if (error instanceof TypeError) {
+      return `Cannot reach ML API at ${ML_API_BASE}. Start backend with: cd /home/kuldeep/Desktop/FYP_PROJECT/FYP/model && /home/kuldeep/Desktop/FYP_PROJECT/FYP/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload`;
+    }
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return fallback;
+  };
+
+  const runSinglePrediction = async () => {
+    if (!singleFile) {
+      setRequestError("Please select a CSV for single prediction.");
+      return;
+    }
+
+    setRequestError("");
+    setIsSingleLoading(true);
+    try {
+      const previewForm = new FormData();
+      previewForm.append("file", singleFile);
+      const previewResponse = await fetch(`${ML_API_BASE}/predict?response_format=json`, {
+        method: "POST",
+        body: previewForm,
+      });
+      const previewRows = await parsePredictionPayload(previewResponse);
+      setPredictionRows(previewRows);
+
+      if (responseFormat !== "json") {
+        const downloadForm = new FormData();
+        downloadForm.append("file", singleFile);
+        const downloadResponse = await fetch(
+          `${ML_API_BASE}/predict?response_format=${responseFormat}`,
+          {
+            method: "POST",
+            body: downloadForm,
+          }
+        );
+
+        if (!downloadResponse.ok) {
+          const errorText = await downloadResponse.text();
+          throw new Error(errorText || "File download failed.");
+        }
+
+        const fileBlob = await downloadResponse.blob();
+        const extension = responseFormat === "csv" ? "csv" : "xlsx";
+        downloadBlob(fileBlob, `single_predictions.${extension}`);
+      }
+    } catch (error) {
+      const message = normalizeRequestError(error, "Single prediction failed.");
+      setRequestError(message);
+    } finally {
+      setIsSingleLoading(false);
+    }
+  };
+
+  const runCombinedPrediction = async () => {
+    if (!layeringFile || !spoofingFile) {
+      setRequestError("Please select both layering and spoofing CSV files.");
+      return;
+    }
+
+    setRequestError("");
+    setIsCombinedLoading(true);
+    try {
+      const previewForm = new FormData();
+      previewForm.append("layering_file", layeringFile);
+      previewForm.append("spoofing_file", spoofingFile);
+      const previewResponse = await fetch(`${ML_API_BASE}/predict-combined?response_format=json`, {
+        method: "POST",
+        body: previewForm,
+      });
+      const previewRows = await parsePredictionPayload(previewResponse);
+      setPredictionRows(previewRows);
+
+      if (responseFormat !== "json") {
+        const downloadForm = new FormData();
+        downloadForm.append("layering_file", layeringFile);
+        downloadForm.append("spoofing_file", spoofingFile);
+        const downloadResponse = await fetch(
+          `${ML_API_BASE}/predict-combined?response_format=${responseFormat}`,
+          {
+            method: "POST",
+            body: downloadForm,
+          }
+        );
+
+        if (!downloadResponse.ok) {
+          const errorText = await downloadResponse.text();
+          throw new Error(errorText || "File download failed.");
+        }
+
+        const fileBlob = await downloadResponse.blob();
+        const extension = responseFormat === "csv" ? "csv" : "xlsx";
+        downloadBlob(fileBlob, `combined_predictions.${extension}`);
+      }
+    } catch (error) {
+      const message = normalizeRequestError(error, "Combined prediction failed.");
+      setRequestError(message);
+    } finally {
+      setIsCombinedLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -29,6 +262,123 @@ export default function MLModel() {
         </div>
       </div>
 
+      {/* Prediction Integration */}
+      <div className="panel">
+        <div className="panel-header">
+          <h2 className="panel-title">ML Inference Integration</h2>
+          <span className="text-xs text-muted-foreground">Connected to {ML_API_BASE}</span>
+        </div>
+        <div className="panel-content space-y-6">
+          <div className="grid grid-cols-3 gap-4">
+            <div className="col-span-1">
+              <label className="data-label mb-2 block">Output Format</label>
+              <select
+                value={responseFormat}
+                onChange={(e) => setResponseFormat(e.target.value as OutputFormat)}
+                className="w-full rounded border border-border-subtle bg-background px-3 py-2 text-sm text-foreground"
+              >
+                <option value="xlsx">xlsx</option>
+                <option value="csv">csv</option>
+                <option value="json">json</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-6">
+            <div className="rounded-md border border-border-subtle p-4 space-y-3">
+              <p className="font-medium text-foreground">Single CSV Prediction</p>
+              <input
+                type="file"
+                accept=".csv"
+                onChange={(e) => setSingleFile(e.target.files?.[0] ?? null)}
+                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
+              />
+              <button
+                onClick={runSinglePrediction}
+                disabled={isSingleLoading}
+                className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm disabled:opacity-60"
+              >
+                {isSingleLoading ? "Running..." : "Run Single Prediction"}
+              </button>
+            </div>
+
+            <div className="rounded-md border border-border-subtle p-4 space-y-3">
+              <p className="font-medium text-foreground">Combined Layering + Spoofing</p>
+              <input
+                type="file"
+                accept=".csv"
+                onChange={(e) => setLayeringFile(e.target.files?.[0] ?? null)}
+                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
+              />
+              <input
+                type="file"
+                accept=".csv"
+                onChange={(e) => setSpoofingFile(e.target.files?.[0] ?? null)}
+                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
+              />
+              <button
+                onClick={runCombinedPrediction}
+                disabled={isCombinedLoading}
+                className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm disabled:opacity-60"
+              >
+                {isCombinedLoading ? "Running..." : "Run Combined Prediction"}
+              </button>
+            </div>
+          </div>
+
+          {requestError && (
+            <div className="rounded-md border border-negative/30 bg-negative/10 px-4 py-3 text-sm text-negative">
+              {requestError}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <p className="data-label">Manipulators (predicted_trader_type = 1)</p>
+            <textarea
+              value={
+                manipulators.length
+                  ? `Count: ${manipulators.length}\nUser IDs: ${manipulatorUserIds}`
+                  : "No manipulators found in current prediction preview."
+              }
+              readOnly
+              className="w-full min-h-[90px] rounded border border-border-subtle bg-secondary/30 px-3 py-2 text-sm text-foreground"
+            />
+          </div>
+
+          <div>
+            <p className="data-label mb-2">Prediction Metrics (Horizontal Scroll)</p>
+            <div className="overflow-x-auto border border-border-subtle rounded">
+              <table className="terminal-table min-w-[1200px]">
+                <thead>
+                  <tr>
+                    {predictionColumns.length ? (
+                      predictionColumns.map((column) => <th key={column}>{column}</th>)
+                    ) : (
+                      <th>No metrics yet</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {predictionRows.length ? (
+                    predictionRows.slice(0, 50).map((row, index) => (
+                      <tr key={`prediction-row-${index}`}>
+                        {predictionColumns.map((column) => (
+                          <td key={`${index}-${column}`}>{formatCellValue(row[column])}</td>
+                        ))}
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td className="text-muted-foreground">Run a prediction to view metrics.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Model Status Overview */}
       <div className="grid grid-cols-3 gap-4">
         <div className="panel col-span-2">
@@ -37,14 +387,14 @@ export default function MLModel() {
             <span
               className={cn(
                 "text-xs font-medium px-2 py-1 rounded",
-                mlModelStatus.status === "TRAINING"
+                liveModelStatus.status === "TRAINING"
                   ? "bg-warning/20 text-warning"
-                  : mlModelStatus.status === "READY"
+                  : liveModelStatus.status === "READY"
                   ? "bg-positive/20 text-positive"
                   : "bg-secondary text-muted-foreground"
               )}
             >
-              {mlModelStatus.status}
+              {liveModelStatus.status}
             </span>
           </div>
           <div className="panel-content space-y-6">
@@ -52,7 +402,7 @@ export default function MLModel() {
               <div className="flex items-center gap-3">
                 <Cpu className="h-8 w-8 text-primary" />
                 <div>
-                  <p className="font-semibold text-foreground">{mlModelStatus.currentModel}</p>
+                  <p className="font-semibold text-foreground">{liveModelStatus.currentModel}</p>
                   <p className="text-sm text-muted-foreground">Active Model Version</p>
                 </div>
               </div>
@@ -62,12 +412,12 @@ export default function MLModel() {
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Training Progress</span>
-                <span className="font-mono text-foreground">{mlModelStatus.progress}%</span>
+                <span className="font-mono text-foreground">{liveModelStatus.progress}%</span>
               </div>
               <div className="h-2 bg-secondary rounded-full overflow-hidden">
                 <div
                   className="h-full bg-primary transition-all duration-500"
-                  style={{ width: `${mlModelStatus.progress}%` }}
+                  style={{ width: `${liveModelStatus.progress}%` }}
                 />
               </div>
             </div>
@@ -78,14 +428,14 @@ export default function MLModel() {
                 <CheckCircle2 className="h-5 w-5 text-positive" />
                 <div>
                   <p className="data-label">Last Training</p>
-                  <p className="text-sm text-foreground">{formatDate(mlModelStatus.lastTraining)}</p>
+                  <p className="text-sm text-foreground">{formatDate(liveModelStatus.lastTraining)}</p>
                 </div>
               </div>
               <div className="flex items-center gap-3">
                 <Clock className="h-5 w-5 text-neutral" />
                 <div>
                   <p className="data-label">Next Scheduled</p>
-                  <p className="text-sm text-foreground">{formatDate(mlModelStatus.nextScheduled)}</p>
+                  <p className="text-sm text-foreground">{formatDate(liveModelStatus.nextScheduled)}</p>
                 </div>
               </div>
             </div>
@@ -102,23 +452,23 @@ export default function MLModel() {
               <Database className="h-8 w-8 text-primary" />
               <div>
                 <p className="text-2xl font-semibold text-foreground">
-                  {formatNumber(mlModelStatus.datasetSize)}
+                  {formatNumber(liveModelStatus.datasetSize)}
                 </p>
                 <p className="text-sm text-muted-foreground">Records</p>
               </div>
             </div>
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
-                <span className="text-muted-foreground">Market Data</span>
-                <span className="text-foreground">12.4M</span>
+                <span className="text-muted-foreground">Manipulators</span>
+                <span className="text-foreground">{manipulators.length}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-muted-foreground">Order Book</span>
-                <span className="text-foreground">2.8M</span>
+                <span className="text-muted-foreground">Non-Manipulators</span>
+                <span className="text-foreground">{Math.max(0, predictionRows.length - manipulators.length)}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-muted-foreground">Trade Records</span>
-                <span className="text-foreground">478K</span>
+                <span className="text-muted-foreground">Preview Rows</span>
+                <span className="text-foreground">{predictionRows.length}</span>
               </div>
             </div>
           </div>
@@ -133,19 +483,19 @@ export default function MLModel() {
         <div className="panel-content">
           <div className="grid grid-cols-4 gap-6">
             <div className="text-center">
-              <p className="text-3xl font-semibold text-positive">{mlModelStatus.accuracy}%</p>
+              <p className="text-3xl font-semibold text-positive">{liveModelStatus.accuracy}%</p>
               <p className="data-label mt-2">Accuracy</p>
             </div>
             <div className="text-center">
-              <p className="text-3xl font-semibold text-neutral">{mlModelStatus.precision}%</p>
+              <p className="text-3xl font-semibold text-neutral">{liveModelStatus.precision}%</p>
               <p className="data-label mt-2">Precision</p>
             </div>
             <div className="text-center">
-              <p className="text-3xl font-semibold text-neutral">{mlModelStatus.recall}%</p>
+              <p className="text-3xl font-semibold text-neutral">{liveModelStatus.recall}%</p>
               <p className="data-label mt-2">Recall</p>
             </div>
             <div className="text-center">
-              <p className="text-3xl font-semibold text-primary">{mlModelStatus.f1Score}%</p>
+              <p className="text-3xl font-semibold text-primary">{liveModelStatus.f1Score}%</p>
               <p className="data-label mt-2">F1 Score</p>
             </div>
           </div>

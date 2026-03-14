@@ -10,7 +10,7 @@ function toSymbol(inst: any): Symbol {
     lot          : 1,
     tick         : 0.05,
     price        : inst.marketPrice ?? inst.price ?? 0,
-    open         : inst.marketPrice ?? 0,
+    open         : inst.sessionOpenPrice ?? inst.marketPrice ?? 0,
     high         : inst.high24h    ?? inst.marketPrice ?? 0,
     low          : inst.low24h     ?? inst.marketPrice ?? 0,
     volume       : inst.volume     ?? 0,

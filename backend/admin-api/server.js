@@ -198,6 +198,61 @@ const INSTRUMENTS = {
   15: { id: '15', name: 'Nifty Next 50 Index',        symbol: 'NIFTY NEXT 50',     basePrice: 70413.4   },
 };
 
+const INSTRUMENT_BY_SYMBOL = Object.values(INSTRUMENTS).reduce((acc, inst) => {
+  acc[inst.symbol] = inst;
+  return acc;
+}, {});
+
+const PRESSURE_PRICE_STATE = new Map();
+const SESSION_OPEN_PRICE_STATE = new Map();
+const MARKET_SESSION_STARTED_AT = new Date().toISOString();
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function computePendingOrderPressureShift(quotesBySymbol) {
+  const pending = readUserOrders().filter((order) =>
+    (order.status === 'PENDING' || order.status === 'PARTIAL') &&
+    Number(order.quantity || 0) > Number(order.filledQuantity || 0) &&
+    Number.isFinite(Number(order.price)) &&
+    Number(order.price) > 0
+  );
+
+  const pressureMap = {};
+  pending.forEach((order) => {
+    const symbolQuote = quotesBySymbol[order.symbol];
+    const ltp = Number(symbolQuote?.last_price || symbolQuote?.marketPrice || 0);
+    if (!ltp || ltp <= 0) return;
+
+    const remainingQty = Math.max(0, Number(order.quantity || 0) - Number(order.filledQuantity || 0));
+    if (remainingQty <= 0) return;
+
+    const distancePct = Math.abs(Number(order.price) - ltp) / ltp;
+    const proximityWeight = 1 / (1 + distancePct * 40);
+    const weightedQty = remainingQty * proximityWeight;
+
+    if (!pressureMap[order.symbol]) pressureMap[order.symbol] = { buy: 0, sell: 0 };
+    if (order.side === 'BUY') pressureMap[order.symbol].buy += weightedQty;
+    if (order.side === 'SELL') pressureMap[order.symbol].sell += weightedQty;
+  });
+
+  const shiftBySymbol = {};
+  Object.entries(pressureMap).forEach(([symbol, p]) => {
+    const total = p.buy + p.sell;
+    if (total <= 0) {
+      shiftBySymbol[symbol] = 0;
+      return;
+    }
+    const imbalance = (p.buy - p.sell) / total;
+    const participation = clampNumber(Math.log10(1 + total) / 4, 0, 1);
+    const targetShift = imbalance * participation * 0.12;
+    shiftBySymbol[symbol] = clampNumber(targetShift, -0.18, 0.18);
+  });
+
+  return shiftBySymbol;
+}
+
 // ─── Market Phase Helper ─────────────────────────────────────────────────────
 // Returns current Indian market phase based on IST time.
 function getMarketPhase() {
@@ -530,33 +585,47 @@ app.get('/api/auth/me', requireUserAuth, (req, res) => {
 
 // Shared helper: fetch latest 24h instrument stats from QuestDB
 async function fetchMarketQuotes() {
-  // ── CRITICAL: only use actual TRADE_MATCH (matching-engine executions) and
-  // ORDER_FILLED (user paper-trade fills) events to derive the LTP.
-  //
-  // Why: ORDER_NEW events are written to trade_logs when a LIMIT order is placed,
-  // using the order's limit price (e.g. ₹1 800 for a sell-limit on a ₹500 stock).
-  // Including those rows in last(price) would momentarily set the LTP to ₹1 800,
-  // causing the matching-loop to fill other pending orders at that phantom price.
-  // ORDER_CANCELLED / ORDER_EXPIRED rows have the same problem.
-  //
-  // Only TRADE_MATCH (C++ matching engine) and ORDER_FILLED (paper-trade backend)
-  // rows carry the real execution price that should drive the live market price.
-  const stats = await questdb(`
-    SELECT
-      split_part(order_id, '-', 1) AS instrument_id,
-      first(price)                 AS price_at_start,
-      last(price)                  AS last_price,
-      max(price)                   AS high24h,
-      min(price)                   AS low24h,
-      sum(quantity)                AS total_volume_qty
-    FROM trade_logs
-    WHERE timestamp > dateadd('h', -24, now())
-      AND order_status_event IN ('TRADE_MATCH', 'ORDER_FILLED')
-    GROUP BY instrument_id
-  `);
+  // ── CRITICAL: only use actual execution events to derive market price.
+  // ORDER_NEW / CANCELLED / EXPIRED carry limit prices, not traded prices.
+  const [latestStats, stats24h] = await Promise.all([
+    questdb(`
+      SELECT
+        split_part(order_id, '-', 1) AS instrument_id,
+        last(price)                  AS last_price,
+        max(timestamp)               AS latest_timestamp
+      FROM trade_logs
+      WHERE order_status_event IN ('TRADE_MATCH', 'ORDER_PARTIAL', 'ORDER_FILLED')
+      GROUP BY instrument_id
+    `),
+    questdb(`
+      SELECT
+        split_part(order_id, '-', 1)               AS instrument_id,
+        max(price)                                 AS high24h,
+        min(price)                                 AS low24h,
+        sum(coalesce(filled_quantity, quantity))   AS total_volume_qty
+      FROM trade_logs
+      WHERE timestamp > dateadd('h', -24, now())
+        AND order_status_event IN ('TRADE_MATCH', 'ORDER_PARTIAL', 'ORDER_FILLED')
+      GROUP BY instrument_id
+    `),
+  ]);
 
-  const priceMap = {};
-  stats.forEach(row => { priceMap[row.instrument_id] = row; });
+  const latestMap = {};
+  latestStats.forEach(row => { latestMap[row.instrument_id] = row; });
+
+  const stats24hMap = {};
+  stats24h.forEach(row => { stats24hMap[row.instrument_id] = row; });
+
+  const quotesBySymbol = {};
+  Object.values(INSTRUMENTS).forEach((inst) => {
+    const latestRow = latestMap[inst.id];
+    const lastPrice = latestRow?.last_price ?? inst.basePrice;
+    quotesBySymbol[inst.symbol] = {
+      last_price: lastPrice,
+    };
+  });
+
+  const pendingShiftBySymbol = computePendingOrderPressureShift(quotesBySymbol);
 
   // ── Circuit-breaker tracking ──────────────────────────────────────────────
   // NSE standard: individual stocks have 20 % daily circuit limits.
@@ -569,9 +638,22 @@ async function fetchMarketQuotes() {
   const CIRCUIT_BANDS = [20, 10, 5, 2]; // highest first so we break on tightest hit
 
   return Object.values(INSTRUMENTS).map(inst => {
-    const row        = priceMap[inst.id];
-    const lastPrice  = row?.last_price    ?? inst.basePrice;
-    const startPrice = row?.price_at_start ?? inst.basePrice;
+    const latestRow = latestMap[inst.id];
+    const row24h = stats24hMap[inst.id];
+    const row = quotesBySymbol[inst.symbol];
+    const tradeDerivedPrice = row?.last_price ?? inst.basePrice;
+    const targetShift = pendingShiftBySymbol[inst.symbol] || 0;
+    const previousShift = PRESSURE_PRICE_STATE.get(inst.symbol) || 0;
+    const nextShift = Math.abs(previousShift * 0.78 + targetShift * 0.22) < 0.00001
+      ? 0
+      : (previousShift * 0.78 + targetShift * 0.22);
+    PRESSURE_PRICE_STATE.set(inst.symbol, nextShift);
+
+    const lastPrice = Math.max(0.01, tradeDerivedPrice * (1 + nextShift));
+    if (!SESSION_OPEN_PRICE_STATE.has(inst.symbol)) {
+      SESSION_OPEN_PRICE_STATE.set(inst.symbol, lastPrice);
+    }
+    const startPrice = SESSION_OPEN_PRICE_STATE.get(inst.symbol) ?? lastPrice;
     const change     = lastPrice - startPrice;
     const changePct  = startPrice ? (change / startPrice) * 100 : 0;
 
@@ -600,11 +682,13 @@ async function fetchMarketQuotes() {
       symbol        : inst.symbol,
       name          : inst.name,
       marketPrice   : lastPrice,
+      sessionOpenPrice: startPrice,
       change        : change,
       changePercent : changePct,
-      high24h       : row?.high24h ?? lastPrice,
-      low24h        : row?.low24h  ?? lastPrice,
-      volume        : row?.total_volume_qty ?? 0,
+      high24h       : Math.max(row24h?.high24h ?? lastPrice, lastPrice),
+      low24h        : Math.min(row24h?.low24h  ?? lastPrice, lastPrice),
+      volume        : row24h?.total_volume_qty ?? 0,
+      latestTimestamp: latestRow?.latest_timestamp ?? MARKET_SESSION_STARTED_AT,
       // Circuit breaker fields (used by matching-loop + frontend)
       circuitStatus : circuitStatus,  // 'UPPER_CIRCUIT' | 'LOWER_CIRCUIT' | 'NONE'
       circuitBand   : circuitBand,    // 2 / 5 / 10 / 20 — 0 means no circuit
@@ -664,14 +748,9 @@ app.get('/api/market/orderbook/:instrumentId', async (req, res) => {
   const inst = resolveInstrument(req.params.instrumentId);
   if (!inst) return res.status(404).json({ error: 'Unknown instrument' });
   try {
-    let bids, asks;
-    try {
-      const eb = await fetchBookFromEngine(inst.id);
-      bids = eb.bids; asks = eb.asks;
-    } catch {
-      const qb = await fetchBookFromQuestDB(inst.id);
-      bids = qb.bids; asks = qb.asks;
-    }
+    const combinedBook = await fetchCombinedBook(inst.id);
+    const bids = combinedBook.bids;
+    const asks = combinedBook.asks;
     res.json({
       symbol: inst.symbol, name: inst.name,
       bids: bids.map(b => ({ price: b.price, quantity: b.qty_buyers  || b.quantity || 0, orders: b.order_count || 1 })),
@@ -695,9 +774,9 @@ app.get('/api/market/orderbook/:instrumentId/stream', (req, res) => {
   async function sendBook() {
     if (closed) return;
     try {
-      let bids, asks;
-      try { const eb = await fetchBookFromEngine(inst.id); bids = eb.bids; asks = eb.asks; }
-      catch { const qb = await fetchBookFromQuestDB(inst.id); bids = qb.bids; asks = qb.asks; }
+      const combinedBook = await fetchCombinedBook(inst.id);
+      const bids = combinedBook.bids;
+      const asks = combinedBook.asks;
       if (closed) return;
       res.write(`data: ${JSON.stringify({
         symbol: inst.symbol, name: inst.name,
@@ -800,6 +879,7 @@ app.post('/api/user/orders', requireUserAuth, async (req, res) => {
   const instId = instEntry ? instEntry.id : '0';
   const order = {
     id            : generateUserOrderId(instId, userId),
+    instrumentId  : instId,
     userId,
     symbol,
     name          : instEntry?.name || symbol,
@@ -1220,44 +1300,19 @@ app.patch('/api/user/positions/target-sl', requireUserAuth, (req, res) => {
  */
 app.get('/api/admin/market/symbols', requireAuth, async (_req, res) => {
   try {
-    const stats24h = await questdb(`
-      SELECT
-        split_part(order_id, '-', 1)   AS instrument_id,
-        first(price)                   AS price_at_start,
-        last(price)                    AS last_price,
-        max(price)                     AS high24h,
-        min(price)                     AS low24h,
-        sum(quantity)                  AS total_volume_qty,
-        max(timestamp)                 AS latest_timestamp
-      FROM trade_logs
-      WHERE timestamp > dateadd('h', -24, now())
-      GROUP BY instrument_id
-      ORDER BY instrument_id
-    `);
-
-    const result = stats24h.map(row => {
-      const instId  = parseInt(row.instrument_id, 10);
-      const inst    = INSTRUMENTS[instId];
-      if (!inst) return null;
-
-      const lastPrice  = row.last_price     ?? 0;
-      const startPrice = row.price_at_start ?? lastPrice;
-      const change     = lastPrice - startPrice;
-      const changePct  = startPrice ? (change / startPrice) * 100 : 0;
-
-      return {
-        instrument_id    : inst.id,
-        instrument_name  : inst.name,
-        symbol           : inst.symbol,
-        last_price       : lastPrice,
-        change           : change,
-        change_percent   : changePct,
-        volume_qty       : row.total_volume_qty ?? 0,
-        high24h          : row.high24h       ?? lastPrice,
-        low24h           : row.low24h        ?? lastPrice,
-        latest_timestamp : row.latest_timestamp,
-      };
-    }).filter(Boolean);
+    const quotes = await fetchMarketQuotes();
+    const result = quotes.map((q) => ({
+      instrument_id    : q.id,
+      instrument_name  : q.name,
+      symbol           : q.symbol,
+      last_price       : q.marketPrice,
+      change           : q.change,
+      change_percent   : q.changePercent,
+      volume_qty       : q.volume,
+      high24h          : q.high24h,
+      low24h           : q.low24h,
+      latest_timestamp : q.latestTimestamp || MARKET_SESSION_STARTED_AT,
+    }));
 
     res.json(result);
   } catch (err) {
@@ -1315,14 +1370,14 @@ async function fetchBookFromQuestDB(instrumentId) {
              sum(quantity - filled_quantity) AS qty_buyers,
              count(1)                        AS order_count
       FROM (
-        SELECT order_id, price, quantity, filled_quantity, status
+        SELECT order_id, price, quantity, filled_quantity, order_status_event
         FROM trade_logs
         WHERE split_part(order_id, '-', 1) = '${instrumentId}'
           AND side = 'BUY'
           AND timestamp > dateadd('s', -15, now())
         LATEST ON timestamp PARTITION BY order_id
       )
-      WHERE (status = 'NEW' OR status = 'PARTIAL')
+      WHERE (order_status_event = 'ORDER_NEW' OR order_status_event = 'ORDER_PARTIAL')
         AND (quantity - filled_quantity) > 0
       GROUP BY price
       ORDER BY price DESC
@@ -1333,14 +1388,14 @@ async function fetchBookFromQuestDB(instrumentId) {
              sum(quantity - filled_quantity) AS qty_sellers,
              count(1)                        AS order_count
       FROM (
-        SELECT order_id, price, quantity, filled_quantity, status
+        SELECT order_id, price, quantity, filled_quantity, order_status_event
         FROM trade_logs
         WHERE split_part(order_id, '-', 1) = '${instrumentId}'
           AND side = 'SELL'
           AND timestamp > dateadd('s', -15, now())
         LATEST ON timestamp PARTITION BY order_id
       )
-      WHERE (status = 'NEW' OR status = 'PARTIAL')
+      WHERE (order_status_event = 'ORDER_NEW' OR order_status_event = 'ORDER_PARTIAL')
         AND (quantity - filled_quantity) > 0
       GROUP BY price
       ORDER BY price ASC
@@ -1351,6 +1406,119 @@ async function fetchBookFromQuestDB(instrumentId) {
     bids: bids.map(b => ({ price: b.price, qty_buyers:  b.qty_buyers,  order_count: b.order_count })),
     asks: asks.map(a => ({ price: a.price, qty_sellers: a.qty_sellers, order_count: a.order_count })),
   };
+}
+
+function aggregateUserPendingBook(instrumentId, ordersSnapshot = null) {
+  const orders = (ordersSnapshot || readUserOrders()).filter((order) => {
+    const resolvedInstId = String(
+      order.instrumentId || INSTRUMENT_BY_SYMBOL[order.symbol]?.id || ''
+    );
+    if (resolvedInstId !== String(instrumentId)) return false;
+    if (order.status !== 'PENDING' && order.status !== 'PARTIAL') return false;
+    const remaining = Math.max(0, (order.quantity || 0) - (order.filledQuantity || 0));
+    return remaining > 0 && Number.isFinite(Number(order.price)) && Number(order.price) > 0;
+  });
+
+  const bidMap = new Map();
+  const askMap = new Map();
+
+  orders.forEach((order) => {
+    const price = Number(order.price);
+    const remaining = Math.max(0, Number(order.quantity || 0) - Number(order.filledQuantity || 0));
+    if (remaining <= 0 || !Number.isFinite(price) || price <= 0) return;
+
+    if (order.side === 'BUY') {
+      const existing = bidMap.get(price) || { price, qty_buyers: 0, order_count: 0 };
+      existing.qty_buyers += remaining;
+      existing.order_count += 1;
+      bidMap.set(price, existing);
+    } else {
+      const existing = askMap.get(price) || { price, qty_sellers: 0, order_count: 0 };
+      existing.qty_sellers += remaining;
+      existing.order_count += 1;
+      askMap.set(price, existing);
+    }
+  });
+
+  const bids = Array.from(bidMap.values()).sort((a, b) => b.price - a.price);
+  const asks = Array.from(askMap.values()).sort((a, b) => a.price - b.price);
+  return { bids, asks };
+}
+
+function mergeBookLevels(baseLevels, userLevels, side, limit = 5) {
+  const mergedMap = new Map();
+  const qtyKey = side === 'BUY' ? 'qty_buyers' : 'qty_sellers';
+
+  [...(baseLevels || []), ...(userLevels || [])].forEach((level) => {
+    const price = Number(level.price);
+    if (!Number.isFinite(price) || price <= 0) return;
+    const qty = Number(level[qtyKey] ?? level.quantity ?? 0);
+    const orders = Number(level.order_count ?? level.orders ?? 0);
+    if (qty <= 0) return;
+
+    const existing = mergedMap.get(price) || { price, [qtyKey]: 0, order_count: 0 };
+    existing[qtyKey] += qty;
+    existing.order_count += Math.max(orders, 1);
+    mergedMap.set(price, existing);
+  });
+
+  const levels = Array.from(mergedMap.values());
+  levels.sort((a, b) => (side === 'BUY' ? b.price - a.price : a.price - b.price));
+  return levels.slice(0, limit);
+}
+
+async function fetchCombinedBook(instrumentId, ordersSnapshot = null) {
+  let baseBids;
+  let baseAsks;
+  try {
+    const engineBook = await fetchBookFromEngine(instrumentId);
+    baseBids = engineBook.bids;
+    baseAsks = engineBook.asks;
+  } catch {
+    const qdbBook = await fetchBookFromQuestDB(instrumentId);
+    baseBids = qdbBook.bids;
+    baseAsks = qdbBook.asks;
+  }
+
+  const userBook = aggregateUserPendingBook(instrumentId, ordersSnapshot);
+  return {
+    bids: mergeBookLevels(baseBids, userBook.bids, 'BUY', 5),
+    asks: mergeBookLevels(baseAsks, userBook.asks, 'SELL', 5),
+  };
+}
+
+function computeExecutionPriceFromDepth(side, quantity, fallbackPrice, book) {
+  const qty = Math.max(1, Number(quantity || 0));
+  const defaultPrice = Number(fallbackPrice || 0);
+  if (!book || defaultPrice <= 0) return defaultPrice;
+
+  const levels = side === 'BUY' ? (book.asks || []) : (book.bids || []);
+  if (!levels.length) return defaultPrice;
+
+  let remaining = qty;
+  let consumed = 0;
+  let notional = 0;
+
+  for (const level of levels) {
+    const levelPrice = Number(level.price || defaultPrice);
+    const levelQty = Number(level.qty_buyers ?? level.qty_sellers ?? level.quantity ?? 0);
+    if (levelQty <= 0 || levelPrice <= 0) continue;
+
+    const take = Math.min(remaining, levelQty);
+    notional += take * levelPrice;
+    consumed += take;
+    remaining -= take;
+    if (remaining <= 0) break;
+  }
+
+  if (consumed <= 0) return defaultPrice;
+  if (remaining <= 0) return notional / consumed;
+
+  const shortageRatio = remaining / qty;
+  const tailPrice = side === 'BUY'
+    ? defaultPrice * (1 + 0.002 * shortageRatio)
+    : Math.max(0.01, defaultPrice * (1 - 0.002 * shortageRatio));
+  return (notional + tailPrice * remaining) / qty;
 }
 
 // ─── Order Book ───────────────────────────────────────────────────────────────
@@ -1391,21 +1559,9 @@ app.get('/api/admin/orders/book/:instrumentId/stream', sseAuth, (req, res) => {
   async function sendBook() {
     if (closed) return;
     try {
-      // ── 1. Try the live in-memory book from the matching engine (port 9100)
-      //       This is the exact same data source as the terminal table.
-      let bids, asks;
-      try {
-        const engineBook = await fetchBookFromEngine(instrumentId);
-        bids = engineBook.bids;
-        asks = engineBook.asks;
-      } catch {
-        // ── 2. Engine offline / not yet started – fall back to QuestDB with a
-        //       15-second sliding window (mirrors the engine's 5 s order expiry
-        //       and adds slack for logging / network jitter).
-        const qdbBook = await fetchBookFromQuestDB(instrumentId);
-        bids = qdbBook.bids;
-        asks = qdbBook.asks;
-      }
+      const combinedBook = await fetchCombinedBook(instrumentId);
+      const bids = combinedBook.bids;
+      const asks = combinedBook.asks;
 
       if (closed) return;
       const payload = JSON.stringify({
@@ -1436,17 +1592,9 @@ app.get('/api/admin/orders/book/:instrumentId', requireAuth, async (req, res) =>
   if (!inst) return res.status(404).json({ error: 'Unknown instrument' });
 
   try {
-    // Try in-memory engine first, fall back to QuestDB
-    let bids, asks;
-    try {
-      const engineBook = await fetchBookFromEngine(instrumentId);
-      bids = engineBook.bids;
-      asks = engineBook.asks;
-    } catch {
-      const qdbBook = await fetchBookFromQuestDB(instrumentId);
-      bids = qdbBook.bids;
-      asks = qdbBook.asks;
-    }
+    const combinedBook = await fetchCombinedBook(instrumentId);
+    const bids = combinedBook.bids;
+    const asks = combinedBook.asks;
     res.json({ instrument_id: inst.id, instrument_name: inst.name, symbol: inst.symbol, bids, asks });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1457,9 +1605,9 @@ app.get('/api/admin/orders/book/:instrumentId', requireAuth, async (req, res) =>
 app.get('/api/admin/orders/book', requireAuth, async (_req, res) => {
   try {
     const rows = await questdb(`
-      SELECT order_id, order_type, side, price, quantity, status, filled_quantity, user_id, timestamp
+      SELECT order_id, order_type, side, price, quantity, order_status_event, filled_quantity, user_id, timestamp
       FROM trade_logs
-      WHERE status = 'NEW' OR status = 'PARTIAL'
+      WHERE order_status_event = 'ORDER_NEW' OR order_status_event = 'ORDER_PARTIAL'
       ORDER BY timestamp DESC
       LIMIT 200
     `);
@@ -1471,7 +1619,7 @@ app.get('/api/admin/orders/book', requireAuth, async (_req, res) => {
       total    : r.price * (r.quantity - r.filled_quantity),
       orderType: r.order_type,
       userId   : r.user_id,
-      status   : r.status,
+      status   : r.order_status_event,
       timestamp: r.timestamp,
     })));
   } catch (err) {
@@ -1681,6 +1829,24 @@ async function runMatchingLoop() {
     // Collect events that must be written to QuestDB after file is saved
     const questdbWrites = []; // { order, fillPrice, filledQty, status }
 
+    // Snapshot combined depth per symbol once per loop tick so execution prices
+    // reflect current liquidity from mock-trader book + pending user orders.
+    const depthBySymbol = {};
+    const pendingSymbols = [...new Set(
+      orders
+        .filter(o => (o.status === 'PENDING' || o.status === 'PARTIAL') && o.symbol)
+        .map(o => o.symbol)
+    )];
+    await Promise.all(pendingSymbols.map(async (symbol) => {
+      const instEntry = Object.values(INSTRUMENTS).find(i => i.symbol === symbol);
+      if (!instEntry) return;
+      try {
+        depthBySymbol[symbol] = await fetchCombinedBook(instEntry.id, orders);
+      } catch {
+        depthBySymbol[symbol] = null;
+      }
+    }));
+
     orders.forEach(order => {
       if (order.status !== 'PENDING' && order.status !== 'PARTIAL') return;
       const currentPrice = priceMap[order.symbol];
@@ -1783,29 +1949,18 @@ async function runMatchingLoop() {
         fillPrice  = currentPrice;
 
       } else if (order.orderType === 'LIMIT') {
-        const limitPx     = order.price;
-        const placedAt    = order.placedAtPrice;  // LTP when order was created
-
-        if (order.side === 'BUY') {
-          // Determine which direction the market must travel to reach the limit.
-          // If no placedAtPrice (legacy order), treat conservatively: require price
-          // to reach the limit from below (i.e. price must rise to limitPx).
-          if (placedAt == null || placedAt <= limitPx) {
-            // Market was AT or BELOW limit when placed  →  wait for price to RISE
-            // Fill at the limit price (avg price = limit price the user specified).
-            if (currentPrice >= limitPx) { shouldFill = true; fillPrice = limitPx; }
-          } else {
-            // Market was ABOVE limit when placed  →  wait for price to DROP
-            // Fill at the limit price so avg price always equals what the user specified.
-            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = limitPx; }
+        const limitPx = Number(order.price || 0);
+        if (limitPx > 0) {
+          // Realistic limit semantics:
+          // BUY  fills when market is AT or BELOW limit price.
+          // SELL fills when market is AT or ABOVE limit price.
+          if (order.side === 'BUY' && currentPrice <= limitPx) {
+            shouldFill = true;
+            fillPrice = currentPrice;
           }
-        } else { // SELL
-          if (placedAt == null || placedAt >= limitPx) {
-            // Market was AT or ABOVE limit when placed  →  wait for price to DROP
-            if (currentPrice <= limitPx) { shouldFill = true; fillPrice = limitPx; }
-          } else {
-            // Market was BELOW limit when placed  →  wait for price to RISE
-            if (currentPrice >= limitPx) { shouldFill = true; fillPrice = limitPx; }
+          if (order.side === 'SELL' && currentPrice >= limitPx) {
+            shouldFill = true;
+            fillPrice = currentPrice;
           }
         }
 
@@ -1849,11 +2004,31 @@ async function runMatchingLoop() {
         const actualChunk  = isLastChunk ? remaining : chunkQty; // never overfill
         const newFilledQty = order.filledQuantity + actualChunk;
 
+        let execPrice = fillPrice;
+        if (order.orderType === 'MARKET' ||
+            order.orderType === 'STOP' ||
+            order.orderType === 'LIMIT' ||
+            order.orderType === 'STOP_LIMIT') {
+          execPrice = computeExecutionPriceFromDepth(
+            order.side,
+            actualChunk,
+            currentPrice,
+            depthBySymbol[order.symbol]
+          );
+
+          if ((order.orderType === 'LIMIT' || order.orderType === 'STOP_LIMIT') && Number(order.price || 0) > 0) {
+            const limitPx = Number(order.price);
+            execPrice = order.side === 'BUY'
+              ? Math.min(execPrice, limitPx)
+              : Math.max(execPrice, limitPx);
+          }
+        }
+
         // Weighted average price: tracks cumulative fill cost across all chunks.
         const prevAvgPrice = order.averagePrice || 0;
         const newAvgPrice  = order.filledQuantity === 0
-          ? fillPrice
-          : (prevAvgPrice * order.filledQuantity + fillPrice * actualChunk) / newFilledQty;
+          ? execPrice
+          : (prevAvgPrice * order.filledQuantity + execPrice * actualChunk) / newFilledQty;
 
         order.filledQuantity = newFilledQty;
         order.averagePrice   = newAvgPrice;
@@ -1870,7 +2045,7 @@ async function runMatchingLoop() {
             if (idx !== -1) {
               // Credit last-chunk proceeds and deduct total fees.
               // Previous partial chunks were already credited per tick.
-              users[idx].balance = (users[idx].balance || 0) + actualChunk * fillPrice - order.fees;
+              users[idx].balance = (users[idx].balance || 0) + actualChunk * execPrice - order.fees;
               writeUsers(users);
             }
           } else {
@@ -1915,7 +2090,7 @@ async function runMatchingLoop() {
             const users = readUsers();
             const idx   = users.findIndex(u => u.id === order.userId);
             if (idx !== -1) {
-              users[idx].balance = (users[idx].balance || 0) + actualChunk * fillPrice;
+              users[idx].balance = (users[idx].balance || 0) + actualChunk * execPrice;
               writeUsers(users);
             }
           } else if (order.isAutoOrder && !order.price && order.autoReason !== 'USER_EXIT' && order.autoReason !== 'USER_EXIT_ALL') {
@@ -1923,7 +2098,7 @@ async function runMatchingLoop() {
             const users = readUsers();
             const idx   = users.findIndex(u => u.id === order.userId);
             if (idx !== -1) {
-              users[idx].balance = (users[idx].balance || 0) - actualChunk * fillPrice;
+              users[idx].balance = (users[idx].balance || 0) - actualChunk * execPrice;
               writeUsers(users);
             }
           }
@@ -1936,7 +2111,7 @@ async function runMatchingLoop() {
           const partCounterpty = pickMockCounterparty();
           const partBuyerUid   = order.side === 'BUY'  ? String(order.userId) : partCounterpty;
           const partSellerUid  = order.side === 'SELL' ? String(order.userId) : partCounterpty;
-          questdbWrites.push({ order: { ...order }, fillPrice, filledQty: newFilledQty, statusEvent: 'ORDER_PARTIAL',
+          questdbWrites.push({ order: { ...order }, fillPrice: execPrice, filledQty: newFilledQty, statusEvent: 'ORDER_PARTIAL',
             opts: { tradeId: partTradeId, buyerUserId: partBuyerUid, sellerUserId: partSellerUid } });
         }
         changed = true;
@@ -2044,6 +2219,7 @@ async function runMatchingLoop() {
         const tslInstEntry     = Object.values(INSTRUMENTS).find(i => i.symbol === pos.symbol);
         newAutoOrders.push({
           id            : generateUserOrderId(tslInstEntry ? tslInstEntry.id : '0', userId),
+          instrumentId  : tslInstEntry ? tslInstEntry.id : '0',
           userId,
           symbol        : pos.symbol,
           name          : pos.name,
@@ -2229,8 +2405,7 @@ app.get('/api/user/orders/stream', (req, res) => {
 
 // ─── Historical OHLCV endpoint ───────────────────────────────────────────────
 // GET /api/market/historical/:instrumentId?interval=1D&limit=90
-// Aggregates real trade_logs candles from QuestDB. Falls back to synthetic
-// candles derived from the instrument's base price when the table is empty.
+// Aggregates real trade_logs candles from QuestDB (executed trades only).
 app.get('/api/market/historical/:instrumentId', async (req, res) => {
   const inst = resolveInstrument(req.params.instrumentId);
   if (!inst) return res.status(404).json({ error: 'Unknown instrument' });
@@ -2257,10 +2432,10 @@ app.get('/api/market/historical/:instrumentId', async (req, res) => {
         max(price)   AS high,
         min(price)   AS low,
         last(price)  AS close,
-        sum(quantity) AS volume
+        sum(coalesce(filled_quantity, quantity)) AS volume
       FROM trade_logs
       WHERE instrument_id = '${inst.id}'
-        AND order_status_event = 'ORDER_FILLED'
+        AND order_status_event IN ('TRADE_MATCH', 'ORDER_PARTIAL', 'ORDER_FILLED')
       SAMPLE BY ${unit}
       ORDER BY timestamp DESC
       LIMIT ${limit}
@@ -2280,28 +2455,8 @@ app.get('/api/market/historical/:instrumentId', async (req, res) => {
       return res.json(candles);
     }
 
-    // No data yet — build synthetic candles from the instrument's base price
-    // using a deterministic random walk so the chart is at least plausible.
-    const candles   = [];
-    const now       = Date.now();
-    const unitMs    = { '1s': 1000, '5s': 5000, '30s': 30000, '1m': 60000, '5m': 300000,
-                        '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000,
-                        '4h': 14400000, '1d': 86400000, '7d': 604800000 };
-    const stepMs    = unitMs[unit] || 86400000;
-
-    let price = inst.basePrice;
-    for (let i = limit - 1; i >= 0; i--) {
-      const time    = now - i * stepMs;
-      const open    = price;
-      const pct     = (Math.sin(i * 0.37 + inst.id * 1.7) * 0.5 + Math.cos(i * 0.13) * 0.3) * 0.015;
-      const close   = Math.max(open * (1 + pct), 1);
-      const high    = Math.max(open, close) * (1 + Math.abs(pct) * 0.3);
-      const low     = Math.min(open, close) * (1 - Math.abs(pct) * 0.3);
-      const volume  = Math.floor(Math.abs(Math.sin(i + 3)) * 500000 + 50000);
-      candles.push({ time, open, high, low, close, volume });
-      price = close;
-    }
-    res.json(candles);
+    // No executed-trade history yet.
+    return res.json([]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
