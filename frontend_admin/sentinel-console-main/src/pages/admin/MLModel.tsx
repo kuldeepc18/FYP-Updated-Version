@@ -6,6 +6,14 @@ import { adminApiClient, ADMIN_API_ENDPOINTS } from "@/config/api";
 type PredictionValue = string | number | boolean | null;
 type PredictionRow = Record<string, PredictionValue>;
 
+type TrackedManipulatorUser = {
+  user_id: string;
+  first_seen_iso?: string;
+  last_seen_iso?: string;
+  detections?: number;
+  is_active?: boolean;
+};
+
 type LivePredictionPayload = {
   updated_at?: string | null;
   refresh_seconds?: number | null;
@@ -13,8 +21,21 @@ type LivePredictionPayload = {
   prediction_rows?: number;
   manipulators_count?: number;
   manipulator_user_ids?: string[];
+  current_manipulator_user_ids?: string[];
+  tracked_manipulator_user_ids?: string[];
+  tracked_manipulator_users?: TrackedManipulatorUser[];
   predictions?: PredictionRow[];
   last_error?: string | null;
+};
+
+const REAL_USER_MIN_ID = 10000;
+
+const normalizeTrackableUserId = (value: unknown): string | null => {
+  const numeric = Number(String(value ?? "").trim());
+  if (!Number.isFinite(numeric) || !Number.isInteger(numeric) || numeric <= REAL_USER_MIN_ID) {
+    return null;
+  }
+  return String(numeric);
 };
 
 export default function MLModel() {
@@ -23,6 +44,7 @@ export default function MLModel() {
   const [predictionRows, setPredictionRows] = useState<PredictionRow[]>([]);
   const [mlApiHealthy, setMlApiHealthy] = useState<boolean | null>(null);
   const [livePayload, setLivePayload] = useState<LivePredictionPayload | null>(null);
+  const [trackedManipulatorUsers, setTrackedManipulatorUsers] = useState<TrackedManipulatorUser[]>([]);
 
   const formatDate = (isoString?: string | null) => {
     if (!isoString) return "—";
@@ -48,16 +70,35 @@ export default function MLModel() {
   }, [predictionRows]);
 
   const manipulators = useMemo(() => {
-    return predictionRows.filter((row) => String(row.predicted_trader_type) === "1");
+    return predictionRows.filter((row) => {
+      if (String(row.predicted_trader_type) !== "1") return false;
+      return normalizeTrackableUserId(row.user_id) !== null;
+    });
   }, [predictionRows]);
 
   const manipulatorUserIds = useMemo(() => {
     const ids = manipulators
-      .map((row) => row.user_id)
-      .filter((value) => value !== null && value !== undefined)
-      .map((value) => String(value));
-    return ids.join(", ");
+      .map((row) => normalizeTrackableUserId(row.user_id))
+      .filter((value): value is string => value !== null);
+    const uniqueIds = Array.from(new Set(ids)).sort((a, b) => Number(a) - Number(b));
+    return uniqueIds.join(", ");
   }, [manipulators]);
+
+  const trackedManipulatorUserIds = useMemo(() => {
+    const ids = trackedManipulatorUsers
+      .map((entry) => normalizeTrackableUserId(entry.user_id))
+      .filter((value): value is string => value !== null);
+    return Array.from(new Set(ids)).sort((a, b) => Number(a) - Number(b));
+  }, [trackedManipulatorUsers]);
+
+  const trackedManipulatorUserIdsText = useMemo(() => {
+    if (!trackedManipulatorUserIds.length) return "";
+    return trackedManipulatorUserIds.join(", ");
+  }, [trackedManipulatorUserIds]);
+
+  const activeTrackedCount = useMemo(() => {
+    return trackedManipulatorUsers.filter((entry) => !!entry.is_active).length;
+  }, [trackedManipulatorUsers]);
 
   const liveModelStatus = useMemo(() => {
     const manipulatorRatio = predictionRows.length
@@ -89,9 +130,13 @@ export default function MLModel() {
       const predictionResponse = await adminApiClient.get(ADMIN_API_ENDPOINTS.ML.PREDICTIONS);
       const payload = predictionResponse.data as LivePredictionPayload;
       const rows = Array.isArray(payload?.predictions) ? payload.predictions : [];
+      const trackedUsers = Array.isArray(payload?.tracked_manipulator_users)
+        ? payload.tracked_manipulator_users
+        : [];
 
       setLivePayload(payload);
       setPredictionRows(rows);
+      setTrackedManipulatorUsers(trackedUsers);
       setMlApiHealthy(true);
       setRequestError(payload?.last_error ? String(payload.last_error) : "");
 
@@ -177,7 +222,20 @@ export default function MLModel() {
               value={
                 manipulators.length
                   ? `Count: ${manipulators.length}\nUser IDs: ${manipulatorUserIds}`
-                  : "No manipulators detected in current live window."
+                  : "No real-user manipulators detected in current live window (tracking user_id > 10000)."
+              }
+              readOnly
+              className="w-full min-h-[90px] rounded border border-border-subtle bg-secondary/30 px-3 py-2 text-sm text-foreground"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <p className="data-label">Manipulator Users (Historical, user_id &gt; 10000)</p>
+            <textarea
+              value={
+                trackedManipulatorUserIds.length
+                  ? `Tracked Users: ${trackedManipulatorUserIds.length}\nCurrently Active: ${activeTrackedCount}\nUser IDs: ${trackedManipulatorUserIdsText}`
+                  : "No real-user manipulators tracked yet."
               }
               readOnly
               className="w-full min-h-[90px] rounded border border-border-subtle bg-secondary/30 px-3 py-2 text-sm text-foreground"
@@ -300,6 +358,10 @@ export default function MLModel() {
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Manipulators</span>
                 <span className="text-foreground">{manipulators.length}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Tracked Manipulator Users</span>
+                <span className="text-foreground">{trackedManipulatorUserIds.length}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Non-Manipulators</span>

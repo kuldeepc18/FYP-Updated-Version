@@ -20,6 +20,89 @@ const JWT_SECRET     = 'ktrade_admin_jwt_secret_2026';
 const USER_JWT_SECRET = 'ktrade_user_jwt_secret_2026';
 const PORT           = 3000;
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000';
+const REAL_USER_MIN_ID = 10000;
+
+const trackedManipulatorUsers = new Map();
+
+function parseNumericUserId(userId) {
+  const value = Number(String(userId ?? '').trim());
+  return Number.isFinite(value) ? value : NaN;
+}
+
+function isTrackableUserId(userId) {
+  const numeric = parseNumericUserId(userId);
+  return Number.isInteger(numeric) && numeric > REAL_USER_MIN_ID;
+}
+
+function normalizeTrackableUserId(userId) {
+  if (!isTrackableUserId(userId)) return null;
+  return String(parseNumericUserId(userId));
+}
+
+function extractCurrentManipulatorUserIds(livePayload) {
+  const idSet = new Set();
+
+  const predictions = Array.isArray(livePayload?.predictions) ? livePayload.predictions : [];
+  predictions.forEach((row) => {
+    const isManipulator = String(row?.predicted_trader_type) === '1';
+    if (!isManipulator) return;
+    const normalized = normalizeTrackableUserId(row?.user_id);
+    if (normalized) idSet.add(normalized);
+  });
+
+  const payloadIds = Array.isArray(livePayload?.manipulator_user_ids)
+    ? livePayload.manipulator_user_ids
+    : [];
+  payloadIds.forEach((userId) => {
+    const normalized = normalizeTrackableUserId(userId);
+    if (normalized) idSet.add(normalized);
+  });
+
+  return Array.from(idSet).sort((a, b) => Number(a) - Number(b));
+}
+
+function updateTrackedManipulatorUsers(currentIds) {
+  const nowMs = Date.now();
+  const currentIdSet = new Set(currentIds);
+
+  trackedManipulatorUsers.forEach((entry) => {
+    entry.is_active = false;
+  });
+
+  currentIds.forEach((userId) => {
+    const existing = trackedManipulatorUsers.get(userId);
+    if (existing) {
+      existing.is_active = true;
+      existing.last_seen_at = nowMs;
+      existing.last_seen_iso = new Date(nowMs).toISOString();
+      existing.detections = (existing.detections || 0) + 1;
+      trackedManipulatorUsers.set(userId, existing);
+      return;
+    }
+
+    trackedManipulatorUsers.set(userId, {
+      user_id: userId,
+      first_seen_at: nowMs,
+      first_seen_iso: new Date(nowMs).toISOString(),
+      last_seen_at: nowMs,
+      last_seen_iso: new Date(nowMs).toISOString(),
+      detections: 1,
+      is_active: true,
+    });
+  });
+
+  if (currentIdSet.size === 0) {
+    trackedManipulatorUsers.forEach((entry, userId) => {
+      trackedManipulatorUsers.set(userId, { ...entry, is_active: false });
+    });
+  }
+}
+
+function getTrackedManipulatorUsersList() {
+  return Array.from(trackedManipulatorUsers.values()).sort(
+    (a, b) => Number(a.user_id) - Number(b.user_id)
+  );
+}
 
 // ─── User data store (file-based, persists across restarts) ──────────────────
 const USERS_FILE = path.join(__dirname, 'users.json');
@@ -1799,7 +1882,19 @@ app.get('/api/admin/ml/predictions', requireAuth, async (req, res) => {
       params: { limit },
       timeout: 12000,
     });
-    res.json(data);
+
+    const currentManipulatorIds = extractCurrentManipulatorUserIds(data);
+    updateTrackedManipulatorUsers(currentManipulatorIds);
+    const trackedUsers = getTrackedManipulatorUsersList();
+
+    res.json({
+      ...data,
+      manipulator_user_ids: currentManipulatorIds,
+      manipulators_count: currentManipulatorIds.length,
+      current_manipulator_user_ids: currentManipulatorIds,
+      tracked_manipulator_user_ids: trackedUsers.map((entry) => entry.user_id),
+      tracked_manipulator_users: trackedUsers,
+    });
   } catch (err) {
     const detail = err?.response?.data || err.message;
     res.status(502).json({ error: 'ML live prediction service unavailable', detail });
@@ -1813,19 +1908,38 @@ app.get('/api/admin/ml/metrics', requireAuth, async (req, res) => {
       params: { limit },
       timeout: 12000,
     });
+    const currentManipulatorIds = extractCurrentManipulatorUserIds(data);
+    updateTrackedManipulatorUsers(currentManipulatorIds);
+    const trackedUsers = getTrackedManipulatorUsersList();
+
     res.json({
       updated_at: data.updated_at || null,
       refresh_seconds: data.refresh_seconds || null,
       trade_log_rows: data.trade_log_rows || 0,
       prediction_rows: data.prediction_rows || 0,
-      manipulators_count: data.manipulators_count || 0,
-      manipulator_user_ids: data.manipulator_user_ids || [],
+      manipulators_count: currentManipulatorIds.length,
+      manipulator_user_ids: currentManipulatorIds,
+      tracked_manipulator_user_ids: trackedUsers.map((entry) => entry.user_id),
+      tracked_manipulator_users: trackedUsers,
       last_error: data.last_error || null,
       source: data.source || null,
     });
   } catch (err) {
     const detail = err?.response?.data || err.message;
     res.status(502).json({ error: 'ML live metrics service unavailable', detail });
+  }
+});
+
+app.get('/api/admin/ml/manipulator-users', requireAuth, async (_req, res) => {
+  try {
+    const trackedUsers = getTrackedManipulatorUsersList();
+    res.json({
+      count: trackedUsers.length,
+      user_ids: trackedUsers.map((entry) => entry.user_id),
+      users: trackedUsers,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
