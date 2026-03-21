@@ -87,6 +87,14 @@ export interface SurveillanceAlert {
   status      : 'ACTIVE' | 'RESOLVED' | 'INVESTIGATING';
 }
 
+export interface ManipulatorUser {
+  user_id        : string;
+  first_seen_iso?: string;
+  last_seen_iso? : string;
+  detections?    : number;
+  is_active?     : boolean;
+}
+
 // ─── Market data ──────────────────────────────────────────────────────────────
 
 export async function getMarketInstruments(): Promise<MarketInstrument[]> {
@@ -149,6 +157,7 @@ export interface TradeHistoryParams {
   status?        : string;   // NEW | PARTIAL | FILLED | CANCELLED | EXPIRED
   side?          : string;   // BUY | SELL
   instrument_id? : string;
+  user_id?       : string;
   limit?         : number;
 }
 
@@ -200,6 +209,50 @@ export async function getTradeStats(): Promise<TradeStats> {
 
 export async function getSurveillanceAlerts(): Promise<SurveillanceAlert[]> {
   return [];
+}
+
+export async function getManipulatorUsers(): Promise<ManipulatorUser[]> {
+  try {
+    const { data } = await adminApiClient.get(ADMIN_API_ENDPOINTS.SURVEILLANCE.MANIPULATOR_USERS);
+    return Array.isArray((data as any)?.users) ? (data as any).users : [];
+  } catch (err) {
+    console.error('getManipulatorUsers failed:', err);
+    return [];
+  }
+}
+
+export async function getSurveillanceUserTrades(userId: string, limit = 500): Promise<TradeRecord[]> {
+  try {
+    const { data } = await adminApiClient.get(ADMIN_API_ENDPOINTS.SURVEILLANCE.USER_TRADES, {
+      params: { user_id: userId, limit },
+    });
+    return (data as any[]).map((r) => ({
+      order_id               : r.order_id               ?? r.id ?? '',
+      instrument_id          : r.instrument_id          ?? '',
+      instrument_name        : r.instrument_name        ?? '',
+      side                   : r.side as 'BUY' | 'SELL',
+      order_type             : r.order_type             ?? r.orderType ?? '',
+      price                  : r.price                  ?? 0,
+      quantity               : r.quantity               ?? 0,
+      filled_quantity        : r.filled_quantity        ?? r.filledQuantity ?? 0,
+      remaining_quantity     : r.remaining_quantity     ?? 0,
+      total                  : r.total                  ?? 0,
+      status                 : r.status                 ?? '',
+      user_id                : r.user_id                ?? r.userId ?? '',
+      trade_id               : r.trade_id               ?? 'NA',
+      buyer_user_id          : r.buyer_user_id          ?? 'NA',
+      seller_user_id         : r.seller_user_id         ?? 'NA',
+      market_phase           : r.market_phase           ?? '',
+      device_id_hash         : r.device_id_hash         ?? '',
+      is_short_sell          : r.is_short_sell          ?? false,
+      order_submit_timestamp : r.order_submit_timestamp ?? 0,
+      order_cancel_timestamp : r.order_cancel_timestamp ?? 0,
+      timestamp              : r.timestamp              ?? '',
+    }));
+  } catch (err) {
+    console.error('getSurveillanceUserTrades failed:', err);
+    return [];
+  }
 }
 
 // ─── Backend health check ─────────────────────────────────────────────────────

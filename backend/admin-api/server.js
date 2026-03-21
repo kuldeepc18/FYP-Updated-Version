@@ -21,8 +21,44 @@ const USER_JWT_SECRET = 'ktrade_user_jwt_secret_2026';
 const PORT           = 3000;
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000';
 const REAL_USER_MIN_ID = 10000;
+const MANIPULATOR_USERS_FILE = path.join(__dirname, 'manipulator_users.json');
 
 const trackedManipulatorUsers = new Map();
+
+function loadTrackedManipulatorUsersFromFile() {
+  try {
+    if (!fs.existsSync(MANIPULATOR_USERS_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(MANIPULATOR_USERS_FILE, 'utf8'));
+    if (!Array.isArray(parsed)) return;
+
+    parsed.forEach((entry) => {
+      const normalized = normalizeTrackableUserId(entry?.user_id);
+      if (!normalized) return;
+      trackedManipulatorUsers.set(normalized, {
+        user_id: normalized,
+        first_seen_at: Number(entry.first_seen_at || 0) || Date.now(),
+        first_seen_iso: entry.first_seen_iso || new Date().toISOString(),
+        last_seen_at: Number(entry.last_seen_at || 0) || Date.now(),
+        last_seen_iso: entry.last_seen_iso || new Date().toISOString(),
+        detections: Number(entry.detections || 0) || 1,
+        is_active: Boolean(entry.is_active),
+      });
+    });
+  } catch {
+    // ignore corrupted historical manipulator user file and continue live tracking
+  }
+}
+
+function persistTrackedManipulatorUsersToFile() {
+  try {
+    const rows = Array.from(trackedManipulatorUsers.values()).sort(
+      (a, b) => Number(a.user_id) - Number(b.user_id)
+    );
+    fs.writeFileSync(MANIPULATOR_USERS_FILE, JSON.stringify(rows, null, 2), 'utf8');
+  } catch {
+    // non-fatal: live tracking continues in memory
+  }
+}
 
 function parseNumericUserId(userId) {
   const value = Number(String(userId ?? '').trim());
@@ -96,12 +132,34 @@ function updateTrackedManipulatorUsers(currentIds) {
       trackedManipulatorUsers.set(userId, { ...entry, is_active: false });
     });
   }
+
+  persistTrackedManipulatorUsersToFile();
 }
 
 function getTrackedManipulatorUsersList() {
   return Array.from(trackedManipulatorUsers.values()).sort(
     (a, b) => Number(a.user_id) - Number(b.user_id)
   );
+}
+
+loadTrackedManipulatorUsersFromFile();
+
+async function refreshTrackedManipulatorUsersFromModel(limit = 50000) {
+  const normalizedLimit = Math.min(Math.max(parseInt(limit, 10) || 50000, 100), 200000);
+  const { data } = await axios.get(`${ML_SERVICE_URL}/predict/live`, {
+    params: { limit: normalizedLimit },
+    timeout: 12000,
+  });
+
+  const currentManipulatorIds = extractCurrentManipulatorUserIds(data);
+  updateTrackedManipulatorUsers(currentManipulatorIds);
+  const trackedUsers = getTrackedManipulatorUsersList();
+
+  return {
+    livePayload: data,
+    currentManipulatorIds,
+    trackedUsers,
+  };
 }
 
 // ─── User data store (file-based, persists across restarts) ──────────────────
@@ -1739,7 +1797,7 @@ const EVENT_TO_STATUS = Object.fromEntries(
 
 app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
   try {
-    const { status, side, instrument_id, limit } = req.query;
+    const { status, side, instrument_id, user_id, limit } = req.query;
     const maxLimit = Math.min(parseInt(limit, 10) || 1000, 5000);
 
     // Always exclude internal TRADE_MATCH rows — only show order lifecycle events
@@ -1759,6 +1817,13 @@ app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
       if (!isNaN(iid) && INSTRUMENTS[iid]) {
         clauses.push(`instrument_id = '${iid}'`);
       }
+    }
+    if (user_id !== undefined && user_id !== null && String(user_id).trim() !== '') {
+      const normalizedUid = normalizeTrackableUserId(user_id);
+      if (!normalizedUid) {
+        return res.status(400).json({ error: `user_id must be an integer greater than ${REAL_USER_MIN_ID}` });
+      }
+      clauses.push(`user_id = '${normalizedUid}'`);
     }
 
     const whereClause = `WHERE ${clauses.join(' AND ')}`;
@@ -1851,6 +1916,75 @@ app.get('/api/admin/trades/history', requireAuth, async (req, res) => {
   }
 });
 
+// ─── AI Surveillance (live, DB-backed) ──────────────────────────────────────
+app.get('/api/admin/surveillance/manipulator-users', requireAuth, async (_req, res) => {
+  try {
+    const { trackedUsers } = await refreshTrackedManipulatorUsersFromModel();
+    res.json({
+      count: trackedUsers.length,
+      user_ids: trackedUsers.map((entry) => entry.user_id),
+      users: trackedUsers,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/surveillance/user-trades', requireAuth, async (req, res) => {
+  try {
+    const { user_id, limit } = req.query;
+    const normalizedUid = normalizeTrackableUserId(user_id);
+    if (!normalizedUid) {
+      return res.status(400).json({ error: `user_id must be an integer greater than ${REAL_USER_MIN_ID}` });
+    }
+
+    const maxLimit = Math.min(Math.max(parseInt(limit, 10) || 500, 1), 5000);
+    const rows = await questdb(`
+      SELECT order_id, instrument_id, order_type, side, price, quantity,
+             order_status_event, filled_quantity, remaining_quantity,
+             user_id, trade_id, buyer_user_id, seller_user_id,
+             market_phase, device_id_hash, is_short_sell,
+             order_submit_timestamp, order_cancel_timestamp, timestamp
+      FROM trade_logs
+      WHERE order_status_event != 'TRADE_MATCH'
+      AND user_id = '${normalizedUid}'
+      ORDER BY timestamp DESC
+      LIMIT ${maxLimit}
+    `);
+
+    res.json(rows.map(r => {
+      const iid    = parseInt(r.instrument_id, 10);
+      const inst   = INSTRUMENTS[iid] || { id: String(iid), name: String(iid), symbol: String(iid) };
+      const status = EVENT_TO_STATUS[r.order_status_event] ?? r.order_status_event ?? '';
+      return {
+        order_id               : r.order_id,
+        instrument_id          : inst.id,
+        instrument_name        : inst.name,
+        side                   : r.side,
+        order_type             : r.order_type,
+        price                  : r.price,
+        quantity               : r.quantity,
+        filled_quantity        : r.filled_quantity,
+        remaining_quantity     : r.remaining_quantity,
+        total                  : r.price * r.quantity,
+        status,
+        user_id                : r.user_id,
+        trade_id               : r.trade_id       ?? 'NA',
+        buyer_user_id          : r.buyer_user_id  ?? 'NA',
+        seller_user_id         : r.seller_user_id ?? 'NA',
+        market_phase           : r.market_phase           ?? '',
+        device_id_hash         : r.device_id_hash         ?? '',
+        is_short_sell          : r.is_short_sell          ?? false,
+        order_submit_timestamp : r.order_submit_timestamp ?? 0,
+        order_cancel_timestamp : r.order_cancel_timestamp ?? 0,
+        timestamp              : r.timestamp,
+      };
+    }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /**
  * GET /api/admin/trades/stats
  * Aggregate totals: total_trades, total_volume, buy_volume, sell_volume
@@ -1877,18 +2011,11 @@ app.get('/api/admin/trades/stats', requireAuth, async (_req, res) => {
 // ─── ML Pipeline (live, QuestDB-backed via model service) ───────────────────
 app.get('/api/admin/ml/predictions', requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50000, 100), 200000);
-    const { data } = await axios.get(`${ML_SERVICE_URL}/predict/live`, {
-      params: { limit },
-      timeout: 12000,
-    });
-
-    const currentManipulatorIds = extractCurrentManipulatorUserIds(data);
-    updateTrackedManipulatorUsers(currentManipulatorIds);
-    const trackedUsers = getTrackedManipulatorUsersList();
+    const { livePayload, currentManipulatorIds, trackedUsers } =
+      await refreshTrackedManipulatorUsersFromModel(req.query.limit);
 
     res.json({
-      ...data,
+      ...livePayload,
       manipulator_user_ids: currentManipulatorIds,
       manipulators_count: currentManipulatorIds.length,
       current_manipulator_user_ids: currentManipulatorIds,
@@ -1903,26 +2030,20 @@ app.get('/api/admin/ml/predictions', requireAuth, async (req, res) => {
 
 app.get('/api/admin/ml/metrics', requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50000, 100), 200000);
-    const { data } = await axios.get(`${ML_SERVICE_URL}/predict/live`, {
-      params: { limit },
-      timeout: 12000,
-    });
-    const currentManipulatorIds = extractCurrentManipulatorUserIds(data);
-    updateTrackedManipulatorUsers(currentManipulatorIds);
-    const trackedUsers = getTrackedManipulatorUsersList();
+    const { livePayload, currentManipulatorIds, trackedUsers } =
+      await refreshTrackedManipulatorUsersFromModel(req.query.limit);
 
     res.json({
-      updated_at: data.updated_at || null,
-      refresh_seconds: data.refresh_seconds || null,
-      trade_log_rows: data.trade_log_rows || 0,
-      prediction_rows: data.prediction_rows || 0,
+      updated_at: livePayload.updated_at || null,
+      refresh_seconds: livePayload.refresh_seconds || null,
+      trade_log_rows: livePayload.trade_log_rows || 0,
+      prediction_rows: livePayload.prediction_rows || 0,
       manipulators_count: currentManipulatorIds.length,
       manipulator_user_ids: currentManipulatorIds,
       tracked_manipulator_user_ids: trackedUsers.map((entry) => entry.user_id),
       tracked_manipulator_users: trackedUsers,
-      last_error: data.last_error || null,
-      source: data.source || null,
+      last_error: livePayload.last_error || null,
+      source: livePayload.source || null,
     });
   } catch (err) {
     const detail = err?.response?.data || err.message;
@@ -1932,7 +2053,7 @@ app.get('/api/admin/ml/metrics', requireAuth, async (req, res) => {
 
 app.get('/api/admin/ml/manipulator-users', requireAuth, async (_req, res) => {
   try {
-    const trackedUsers = getTrackedManipulatorUsersList();
+    const { trackedUsers } = await refreshTrackedManipulatorUsersFromModel();
     res.json({
       count: trackedUsers.length,
       user_ids: trackedUsers.map((entry) => entry.user_id),

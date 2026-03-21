@@ -65,5 +65,7 @@ export const ADMIN_API_ENDPOINTS = {
   SURVEILLANCE: {
     ALERTS: '/surveillance/alerts',
     PATTERNS: '/surveillance/patterns',
+    MANIPULATOR_USERS: '/surveillance/manipulator-users',
+    USER_TRADES: '/surveillance/user-trades',
   },
 } as const;
