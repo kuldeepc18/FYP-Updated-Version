@@ -59,6 +59,7 @@ export const ADMIN_API_ENDPOINTS = {
   ML: {
     PREDICTIONS: '/ml/predictions',
     METRICS: '/ml/metrics',
+    HEALTH: '/ml/health',
   },
   SURVEILLANCE: {
     ALERTS: '/surveillance/alerts',

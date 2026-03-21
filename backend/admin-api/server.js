@@ -19,6 +19,7 @@ const QUESTDB_ILP    = 'http://127.0.0.1:9000/write'; // ILP HTTP ingestion endp
 const JWT_SECRET     = 'ktrade_admin_jwt_secret_2026';
 const USER_JWT_SECRET = 'ktrade_user_jwt_secret_2026';
 const PORT           = 3000;
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000';
 
 // ─── User data store (file-based, persists across restarts) ──────────────────
 const USERS_FILE = path.join(__dirname, 'users.json');
@@ -1787,6 +1788,54 @@ app.get('/api/admin/trades/stats', requireAuth, async (_req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── ML Pipeline (live, QuestDB-backed via model service) ───────────────────
+app.get('/api/admin/ml/predictions', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50000, 100), 200000);
+    const { data } = await axios.get(`${ML_SERVICE_URL}/predict/live`, {
+      params: { limit },
+      timeout: 12000,
+    });
+    res.json(data);
+  } catch (err) {
+    const detail = err?.response?.data || err.message;
+    res.status(502).json({ error: 'ML live prediction service unavailable', detail });
+  }
+});
+
+app.get('/api/admin/ml/metrics', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50000, 100), 200000);
+    const { data } = await axios.get(`${ML_SERVICE_URL}/predict/live`, {
+      params: { limit },
+      timeout: 12000,
+    });
+    res.json({
+      updated_at: data.updated_at || null,
+      refresh_seconds: data.refresh_seconds || null,
+      trade_log_rows: data.trade_log_rows || 0,
+      prediction_rows: data.prediction_rows || 0,
+      manipulators_count: data.manipulators_count || 0,
+      manipulator_user_ids: data.manipulator_user_ids || [],
+      last_error: data.last_error || null,
+      source: data.source || null,
+    });
+  } catch (err) {
+    const detail = err?.response?.data || err.message;
+    res.status(502).json({ error: 'ML live metrics service unavailable', detail });
+  }
+});
+
+app.get('/api/admin/ml/health', requireAuth, async (_req, res) => {
+  try {
+    const { data } = await axios.get(`${ML_SERVICE_URL}/health`, { timeout: 8000 });
+    res.json(data);
+  } catch (err) {
+    const detail = err?.response?.data || err.message;
+    res.status(502).json({ error: 'ML service health check failed', detail });
   }
 });
 

@@ -1,41 +1,40 @@
 import { cn } from "@/lib/utils";
 import { Database, Cpu, CheckCircle2, Clock, AlertCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { adminApiClient, ADMIN_API_ENDPOINTS } from "@/config/api";
 
-type OutputFormat = "json" | "csv" | "xlsx";
 type PredictionValue = string | number | boolean | null;
 type PredictionRow = Record<string, PredictionValue>;
 
-const resolveDefaultMlApiBase = () => {
-  if (typeof window === "undefined") {
-    return "http://127.0.0.1:8000";
-  }
-  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-  return `${protocol}//${window.location.hostname}:8000`;
+type LivePredictionPayload = {
+  updated_at?: string | null;
+  refresh_seconds?: number | null;
+  trade_log_rows?: number;
+  prediction_rows?: number;
+  manipulators_count?: number;
+  manipulator_user_ids?: string[];
+  predictions?: PredictionRow[];
+  last_error?: string | null;
 };
 
-const ML_API_BASE =
-  (import.meta.env.VITE_ML_API_URL as string | undefined)?.replace(/\/$/, "") ||
-  resolveDefaultMlApiBase();
-
 export default function MLModel() {
-  const [singleFile, setSingleFile] = useState<File | null>(null);
-  const [layeringFile, setLayeringFile] = useState<File | null>(null);
-  const [spoofingFile, setSpoofingFile] = useState<File | null>(null);
-  const [responseFormat, setResponseFormat] = useState<OutputFormat>("xlsx");
-  const [isSingleLoading, setIsSingleLoading] = useState(false);
-  const [isCombinedLoading, setIsCombinedLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [requestError, setRequestError] = useState<string>("");
   const [predictionRows, setPredictionRows] = useState<PredictionRow[]>([]);
   const [mlApiHealthy, setMlApiHealthy] = useState<boolean | null>(null);
+  const [livePayload, setLivePayload] = useState<LivePredictionPayload | null>(null);
 
-  const formatDate = (isoString: string) => {
-    return new Date(isoString).toLocaleString("en-US", {
+  const formatDate = (isoString?: string | null) => {
+    if (!isoString) return "—";
+    const parsed = new Date(isoString);
+    if (Number.isNaN(parsed.getTime())) return "—";
+    return parsed.toLocaleString("en-US", {
       year: "numeric",
       month: "short",
       day: "numeric",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
     });
   };
 
@@ -61,39 +60,70 @@ export default function MLModel() {
   }, [manipulators]);
 
   const liveModelStatus = useMemo(() => {
-    const nowIso = new Date().toISOString();
     const manipulatorRatio = predictionRows.length
       ? (manipulators.length / predictionRows.length) * 100
       : 0;
+    const lastUpdate = livePayload?.updated_at || null;
+    const refreshSeconds = Number(livePayload?.refresh_seconds || 3);
+    const nextScheduled = lastUpdate
+      ? new Date(new Date(lastUpdate).getTime() + refreshSeconds * 1000).toISOString()
+      : null;
+
     return {
-      currentModel: "Live Prediction Service",
+      currentModel: "Streaming Manipulator Detection",
       status: mlApiHealthy ? "READY" : mlApiHealthy === false ? "OFFLINE" : "CONNECTING",
       progress: mlApiHealthy ? 100 : 0,
-      lastTraining: nowIso,
-      nextScheduled: nowIso,
-      datasetSize: predictionRows.length,
+      lastTraining: lastUpdate,
+      nextScheduled,
+      datasetSize: Number(livePayload?.trade_log_rows || 0),
       accuracy: predictionRows.length ? (100 - manipulatorRatio).toFixed(1) : "—",
       precision: predictionRows.length ? (100 - manipulatorRatio).toFixed(1) : "—",
       recall: predictionRows.length ? manipulatorRatio.toFixed(1) : "—",
       f1Score: predictionRows.length ? (100 - manipulatorRatio / 2).toFixed(1) : "—",
     };
-  }, [mlApiHealthy, predictionRows.length, manipulators.length]);
+  }, [mlApiHealthy, predictionRows.length, manipulators.length, livePayload]);
+
+  const fetchLivePredictions = async () => {
+    setIsLoading(true);
+    try {
+      const predictionResponse = await adminApiClient.get(ADMIN_API_ENDPOINTS.ML.PREDICTIONS);
+      const payload = predictionResponse.data as LivePredictionPayload;
+      const rows = Array.isArray(payload?.predictions) ? payload.predictions : [];
+
+      setLivePayload(payload);
+      setPredictionRows(rows);
+      setMlApiHealthy(true);
+      setRequestError(payload?.last_error ? String(payload.last_error) : "");
+
+      adminApiClient
+        .get(ADMIN_API_ENDPOINTS.ML.HEALTH)
+        .then((response) => {
+          setMlApiHealthy(response.status >= 200 && response.status < 300);
+        })
+        .catch(() => {
+          setMlApiHealthy(true);
+        });
+    } catch (error) {
+      setMlApiHealthy(false);
+      if (error instanceof Error) {
+        setRequestError(error.message);
+      } else {
+        setRequestError("Live ML pipeline unavailable.");
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
-    const probeHealth = async () => {
-      try {
-        const response = await fetch(`${ML_API_BASE}/health`);
-        if (!mounted) return;
-        setMlApiHealthy(response.ok);
-      } catch {
-        if (!mounted) return;
-        setMlApiHealthy(false);
-      }
+    const load = async () => {
+      if (!mounted) return;
+      await fetchLivePredictions();
     };
 
-    probeHealth();
-    const timer = setInterval(probeHealth, 10000);
+    load();
+    const timer = setInterval(load, 3000);
     return () => {
       mounted = false;
       clearInterval(timer);
@@ -103,151 +133,6 @@ export default function MLModel() {
   const formatCellValue = (value: PredictionValue) => {
     if (value === null || value === undefined) return "";
     return String(value);
-  };
-
-  const parsePredictionPayload = async (response: Response): Promise<PredictionRow[]> => {
-    const contentType = response.headers.get("content-type") || "";
-    const rawText = await response.text();
-    if (!response.ok) {
-      throw new Error(rawText || `Request failed with status ${response.status}`);
-    }
-
-    if (!contentType.includes("application/json")) {
-      throw new Error(`Expected JSON preview response, got ${contentType || "unknown type"}`);
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      throw new Error(`Invalid JSON preview response: ${rawText.slice(0, 200)}`);
-    }
-
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("Preview response is empty.");
-    }
-
-    const records = (parsed as { predictions?: unknown }).predictions;
-    if (!Array.isArray(records)) {
-      throw new Error("Preview response missing 'predictions' array.");
-    }
-
-    return records as PredictionRow[];
-  };
-
-  const downloadBlob = (blob: Blob, filename: string) => {
-    const objectUrl = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = objectUrl;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(objectUrl);
-  };
-
-  const normalizeRequestError = (error: unknown, fallback: string) => {
-    if (error instanceof TypeError) {
-      return `Cannot reach ML API at ${ML_API_BASE}. Start backend with: cd /home/kuldeep/Desktop/FYP_PROJECT/FYP/model && /home/kuldeep/Desktop/FYP_PROJECT/FYP/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload`;
-    }
-    if (error instanceof Error) {
-      return error.message;
-    }
-    return fallback;
-  };
-
-  const runSinglePrediction = async () => {
-    if (!singleFile) {
-      setRequestError("Please select a CSV for single prediction.");
-      return;
-    }
-
-    setRequestError("");
-    setIsSingleLoading(true);
-    try {
-      const previewForm = new FormData();
-      previewForm.append("file", singleFile);
-      const previewResponse = await fetch(`${ML_API_BASE}/predict?response_format=json`, {
-        method: "POST",
-        body: previewForm,
-      });
-      const previewRows = await parsePredictionPayload(previewResponse);
-      setPredictionRows(previewRows);
-
-      if (responseFormat !== "json") {
-        const downloadForm = new FormData();
-        downloadForm.append("file", singleFile);
-        const downloadResponse = await fetch(
-          `${ML_API_BASE}/predict?response_format=${responseFormat}`,
-          {
-            method: "POST",
-            body: downloadForm,
-          }
-        );
-
-        if (!downloadResponse.ok) {
-          const errorText = await downloadResponse.text();
-          throw new Error(errorText || "File download failed.");
-        }
-
-        const fileBlob = await downloadResponse.blob();
-        const extension = responseFormat === "csv" ? "csv" : "xlsx";
-        downloadBlob(fileBlob, `single_predictions.${extension}`);
-      }
-    } catch (error) {
-      const message = normalizeRequestError(error, "Single prediction failed.");
-      setRequestError(message);
-    } finally {
-      setIsSingleLoading(false);
-    }
-  };
-
-  const runCombinedPrediction = async () => {
-    if (!layeringFile || !spoofingFile) {
-      setRequestError("Please select both layering and spoofing CSV files.");
-      return;
-    }
-
-    setRequestError("");
-    setIsCombinedLoading(true);
-    try {
-      const previewForm = new FormData();
-      previewForm.append("layering_file", layeringFile);
-      previewForm.append("spoofing_file", spoofingFile);
-      const previewResponse = await fetch(`${ML_API_BASE}/predict-combined?response_format=json`, {
-        method: "POST",
-        body: previewForm,
-      });
-      const previewRows = await parsePredictionPayload(previewResponse);
-      setPredictionRows(previewRows);
-
-      if (responseFormat !== "json") {
-        const downloadForm = new FormData();
-        downloadForm.append("layering_file", layeringFile);
-        downloadForm.append("spoofing_file", spoofingFile);
-        const downloadResponse = await fetch(
-          `${ML_API_BASE}/predict-combined?response_format=${responseFormat}`,
-          {
-            method: "POST",
-            body: downloadForm,
-          }
-        );
-
-        if (!downloadResponse.ok) {
-          const errorText = await downloadResponse.text();
-          throw new Error(errorText || "File download failed.");
-        }
-
-        const fileBlob = await downloadResponse.blob();
-        const extension = responseFormat === "csv" ? "csv" : "xlsx";
-        downloadBlob(fileBlob, `combined_predictions.${extension}`);
-      }
-    } catch (error) {
-      const message = normalizeRequestError(error, "Combined prediction failed.");
-      setRequestError(message);
-    } finally {
-      setIsCombinedLoading(false);
-    }
   };
 
   return (
@@ -266,69 +151,23 @@ export default function MLModel() {
       <div className="panel">
         <div className="panel-header">
           <h2 className="panel-title">ML Inference Integration</h2>
-          <span className="text-xs text-muted-foreground">Connected to {ML_API_BASE}</span>
+          <span className="text-xs text-muted-foreground">Streaming from trade_logs</span>
         </div>
         <div className="panel-content space-y-6">
-          <div className="grid grid-cols-3 gap-4">
-            <div className="col-span-1">
-              <label className="data-label mb-2 block">Output Format</label>
-              <select
-                value={responseFormat}
-                onChange={(e) => setResponseFormat(e.target.value as OutputFormat)}
-                className="w-full rounded border border-border-subtle bg-background px-3 py-2 text-sm text-foreground"
-              >
-                <option value="xlsx">xlsx</option>
-                <option value="csv">csv</option>
-                <option value="json">json</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-6">
-            <div className="rounded-md border border-border-subtle p-4 space-y-3">
-              <p className="font-medium text-foreground">Single CSV Prediction</p>
-              <input
-                type="file"
-                accept=".csv"
-                onChange={(e) => setSingleFile(e.target.files?.[0] ?? null)}
-                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
-              />
-              <button
-                onClick={runSinglePrediction}
-                disabled={isSingleLoading}
-                className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm disabled:opacity-60"
-              >
-                {isSingleLoading ? "Running..." : "Run Single Prediction"}
-              </button>
-            </div>
-
-            <div className="rounded-md border border-border-subtle p-4 space-y-3">
-              <p className="font-medium text-foreground">Combined Layering + Spoofing</p>
-              <input
-                type="file"
-                accept=".csv"
-                onChange={(e) => setLayeringFile(e.target.files?.[0] ?? null)}
-                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
-              />
-              <input
-                type="file"
-                accept=".csv"
-                onChange={(e) => setSpoofingFile(e.target.files?.[0] ?? null)}
-                className="w-full text-sm text-muted-foreground file:mr-3 file:rounded file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-foreground"
-              />
-              <button
-                onClick={runCombinedPrediction}
-                disabled={isCombinedLoading}
-                className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm disabled:opacity-60"
-              >
-                {isCombinedLoading ? "Running..." : "Run Combined Prediction"}
-              </button>
-            </div>
+          <div className="rounded-md border border-border-subtle p-4 text-sm text-muted-foreground">
+            Live pipeline mode is active. Trades are fetched continuously from the database, metrics
+            are recalculated automatically, and manipulators update in real time.
           </div>
 
           {requestError && (
             <div className="rounded-md border border-negative/30 bg-negative/10 px-4 py-3 text-sm text-negative">
               {requestError}
+            </div>
+          )}
+
+          {isLoading && (
+            <div className="rounded-md border border-border-subtle bg-secondary/30 px-4 py-3 text-sm text-muted-foreground">
+              Refreshing live predictions...
             </div>
           )}
 
@@ -338,7 +177,7 @@ export default function MLModel() {
               value={
                 manipulators.length
                   ? `Count: ${manipulators.length}\nUser IDs: ${manipulatorUserIds}`
-                  : "No manipulators found in current prediction preview."
+                  : "No manipulators detected in current live window."
               }
               readOnly
               className="w-full min-h-[90px] rounded border border-border-subtle bg-secondary/30 px-3 py-2 text-sm text-foreground"
@@ -369,7 +208,7 @@ export default function MLModel() {
                     ))
                   ) : (
                     <tr>
-                      <td className="text-muted-foreground">Run a prediction to view metrics.</td>
+                      <td className="text-muted-foreground">Waiting for incoming live trades to compute metrics.</td>
                     </tr>
                   )}
                 </tbody>
@@ -523,73 +362,47 @@ export default function MLModel() {
                 <td className="font-medium text-foreground">Data Extraction</td>
                 <td className="text-muted-foreground">Pull records from database</td>
                 <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-positive/20 text-positive">
-                    COMPLETE
+                  <span className={cn(
+                    "text-xs px-2 py-0.5 rounded",
+                    mlApiHealthy ? "bg-positive/20 text-positive" : "bg-secondary text-muted-foreground"
+                  )}>
+                    {mlApiHealthy ? "LIVE" : "WAITING"}
                   </span>
                 </td>
-                <td className="text-right font-mono text-muted-foreground">2h 34m</td>
+                <td className="text-right font-mono text-muted-foreground">{livePayload?.refresh_seconds ?? 3}s</td>
                 <td className="text-right font-mono text-xs text-muted-foreground">
-                  Jan 5, 12:30
-                </td>
-              </tr>
-              <tr>
-                <td className="font-medium text-foreground">Data Preprocessing</td>
-                <td className="text-muted-foreground">Clean and normalize data</td>
-                <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-positive/20 text-positive">
-                    COMPLETE
-                  </span>
-                </td>
-                <td className="text-right font-mono text-muted-foreground">1h 12m</td>
-                <td className="text-right font-mono text-xs text-muted-foreground">
-                  Jan 5, 13:42
+                  {formatDate(livePayload?.updated_at || null)}
                 </td>
               </tr>
               <tr>
                 <td className="font-medium text-foreground">Feature Engineering</td>
-                <td className="text-muted-foreground">Generate training features</td>
+                <td className="text-muted-foreground">Compute behavioral metrics per user</td>
                 <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-positive/20 text-positive">
-                    COMPLETE
+                  <span className={cn(
+                    "text-xs px-2 py-0.5 rounded",
+                    mlApiHealthy ? "bg-positive/20 text-positive" : "bg-secondary text-muted-foreground"
+                  )}>
+                    {mlApiHealthy ? "LIVE" : "WAITING"}
                   </span>
                 </td>
-                <td className="text-right font-mono text-muted-foreground">45m</td>
+                <td className="text-right font-mono text-muted-foreground">{livePayload?.refresh_seconds ?? 3}s</td>
                 <td className="text-right font-mono text-xs text-muted-foreground">
-                  Jan 5, 14:27
+                  {formatDate(livePayload?.updated_at || null)}
                 </td>
               </tr>
               <tr>
-                <td className="font-medium text-foreground">Model Training</td>
-                <td className="text-muted-foreground">Train neural network</td>
+                <td className="font-medium text-foreground">Manipulator Classification</td>
+                <td className="text-muted-foreground">Predict trader type and publish manipulators</td>
                 <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-warning/20 text-warning animate-pulse-subtle">
-                    IN PROGRESS
+                  <span className={cn(
+                    "text-xs px-2 py-0.5 rounded",
+                    mlApiHealthy ? "bg-positive/20 text-positive" : "bg-secondary text-muted-foreground"
+                  )}>
+                    {mlApiHealthy ? "LIVE" : "WAITING"}
                   </span>
                 </td>
-                <td className="text-right font-mono text-muted-foreground">~4h</td>
-                <td className="text-right font-mono text-xs text-muted-foreground">—</td>
-              </tr>
-              <tr>
-                <td className="font-medium text-foreground">Evaluation</td>
-                <td className="text-muted-foreground">Validate model performance</td>
-                <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-secondary text-muted-foreground">
-                    PENDING
-                  </span>
-                </td>
-                <td className="text-right font-mono text-muted-foreground">~30m</td>
-                <td className="text-right font-mono text-xs text-muted-foreground">—</td>
-              </tr>
-              <tr>
-                <td className="font-medium text-foreground">Deployment</td>
-                <td className="text-muted-foreground">Deploy to surveillance system</td>
-                <td>
-                  <span className="text-xs px-2 py-0.5 rounded bg-secondary text-muted-foreground">
-                    PENDING
-                  </span>
-                </td>
-                <td className="text-right font-mono text-muted-foreground">~15m</td>
-                <td className="text-right font-mono text-xs text-muted-foreground">—</td>
+                <td className="text-right font-mono text-muted-foreground">{livePayload?.refresh_seconds ?? 3}s</td>
+                <td className="text-right font-mono text-xs text-muted-foreground">{formatDate(livePayload?.updated_at || null)}</td>
               </tr>
             </tbody>
           </table>
@@ -600,10 +413,10 @@ export default function MLModel() {
       <div className="flex items-start gap-3 p-4 rounded-md bg-secondary/50 border border-border-subtle">
         <AlertCircle className="h-5 w-5 text-muted-foreground flex-shrink-0 mt-0.5" />
         <div className="text-sm text-muted-foreground">
-          <p className="font-medium text-foreground">Read-Only Access</p>
+          <p className="font-medium text-foreground">Live Detection Mode</p>
           <p className="mt-1">
-            Database access is read-only. Data is used exclusively for model preparation and
-            evaluation. No modifications or deletions are permitted.
+            This view consumes only live trade data from the running system and continuously updates
+            manipulator predictions while backend, frontend, model service, and database remain online.
           </p>
         </div>
       </div>
