@@ -3,10 +3,10 @@
     "user_id": "10002",
     "first_seen_at": 1776496169110,
     "first_seen_iso": "2026-04-18T07:09:29.110Z",
-    "last_seen_at": 1776496453439,
-    "last_seen_iso": "2026-04-18T07:14:13.439Z",
-    "detections": 96,
-    "is_active": true
+    "last_seen_at": 1780719764828,
+    "last_seen_iso": "2026-06-06T04:22:44.828Z",
+    "detections": 101,
+    "is_active": false
   },
   {
     "user_id": "10014",
