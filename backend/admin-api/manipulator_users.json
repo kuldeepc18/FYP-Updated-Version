@@ -1,0 +1,20 @@
+[
+  {
+    "user_id": "10002",
+    "first_seen_at": 1776496169110,
+    "first_seen_iso": "2026-04-18T07:09:29.110Z",
+    "last_seen_at": 1776496453439,
+    "last_seen_iso": "2026-04-18T07:14:13.439Z",
+    "detections": 96,
+    "is_active": true
+  },
+  {
+    "user_id": "10014",
+    "first_seen_at": 1776486890075,
+    "first_seen_iso": "2026-04-18T04:34:50.075Z",
+    "last_seen_at": 1776492538230,
+    "last_seen_iso": "2026-04-18T06:08:58.230Z",
+    "detections": 47,
+    "is_active": false
+  }
+]
